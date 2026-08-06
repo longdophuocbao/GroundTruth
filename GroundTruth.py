@@ -13,11 +13,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                              QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, 
                              QGroupBox, QComboBox, QFileDialog, QMessageBox, QCheckBox,
-                             QDoubleSpinBox, QSpinBox)
+                             QDoubleSpinBox, QSpinBox, QDialog)
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor
 
 class TagTracker:
-    def __init__(self, tag_id, alpha=0.3, max_lost_frames=15):
+    def __init__(self, tag_id, alpha=0.7, max_lost_frames=15):
         self.tag_id = tag_id
         self.alpha = alpha
         self.max_lost_frames = max_lost_frames
@@ -31,7 +31,7 @@ class TagTracker:
         self.lost_frames = 0
         self.is_tracked = False
 
-    def update(self, corners, pos_pnp, pos_depth, rvec, tvec, alpha=0.3, max_lost_frames=15):
+    def update(self, corners, pos_pnp, pos_depth, rvec, tvec, alpha=0.7, max_lost_frames=15):
         self.alpha = alpha
         self.max_lost_frames = max_lost_frames
         self.lost_frames = 0
@@ -78,10 +78,10 @@ class CameraWorker(QThread):
         self._tag_size = 0.150 # meters (150mm)
         self._source_id = 1
         self._target_ids_str = ""
-        self._coord_mode = "pnp" # "pnp" or "depth"
+        self._coord_mode = "depth" # "pnp" or "depth"
         
         # Tracking config
-        self._filter_alpha = 0.3
+        self._filter_alpha = 0.7
         self._max_lost_frames = 15
         self._enable_smoothing = True
         self._enable_keep_alive = True
@@ -144,6 +144,19 @@ class CameraWorker(QThread):
 
     def run(self):
         self.running = True
+        self.status_msg.emit("Đang quét kết nối thiết bị RealSense...")
+        try:
+            ctx = rs.context()
+            devices = ctx.query_devices()
+            if len(devices) == 0:
+                self.error_occurred.emit("Không tìm thấy camera Intel RealSense nào đang kết nối. Vui lòng kiểm tra lại cáp cắm.")
+                self.running = False
+                return
+        except Exception as e:
+            self.error_occurred.emit(f"Lỗi khi kiểm tra thiết bị: {str(e)}")
+            self.running = False
+            return
+            
         self.status_msg.emit("Đang khởi tạo camera RealSense...")
         
         # Create pipeline and config
@@ -570,12 +583,164 @@ class CameraWorker(QThread):
             pass # ignore logger errors during thread run to keep camera stream active
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cài Đặt Tham Số Hệ Thống")
+        self.setMinimumWidth(500)
+        self.init_ui(parent)
+        
+    def init_ui(self, parent):
+        layout = QVBoxLayout(self)
+        
+        # 1. Config parameters group
+        config_group = QGroupBox("CẤU HÌNH PHÁT HIỆN & THỐNG KÊ")
+        config_grid = QGridLayout(config_group)
+        
+        # Tag size in mm
+        config_grid.addWidget(QLabel("Kích thước AprilTag (mm):"), 0, 0)
+        self.sb_tag_size = QDoubleSpinBox()
+        self.sb_tag_size.setRange(1.0, 1000.0)
+        self.sb_tag_size.setValue(150.0) # default 150mm
+        self.sb_tag_size.setSuffix(" mm")
+        config_grid.addWidget(self.sb_tag_size, 0, 1)
+        
+        # Source tag ID (ID 1)
+        config_grid.addWidget(QLabel("AprilTag ID Nguồn (Gốc):"), 1, 0)
+        self.sb_source_id = QSpinBox()
+        self.sb_source_id.setRange(0, 1000)
+        self.sb_source_id.setValue(1) # Default ID 1
+        config_grid.addWidget(self.sb_source_id, 1, 1)
+        
+        # Target tag IDs
+        config_grid.addWidget(QLabel("ID Đường Mục Tiêu (Ngăn cách bằng dấu phẩy):"), 2, 0)
+        self.txt_target_ids = QLineEdit()
+        self.txt_target_ids.setPlaceholderText("Trống: Dùng tất cả tag khác")
+        config_grid.addWidget(self.txt_target_ids, 2, 1)
+        
+        # Coordinate calculation mode
+        config_grid.addWidget(QLabel("Thuật toán tọa độ 3D:"), 3, 0)
+        self.cb_coord_mode = QComboBox()
+        self.cb_coord_mode.addItem("Sử dụng Cảm biến Depth RealSense trực tiếp (Mặc định)", "depth")
+        self.cb_coord_mode.addItem("Sử dụng SolvePnP hình học", "pnp")
+        config_grid.addWidget(self.cb_coord_mode, 3, 1)
+        
+        layout.addWidget(config_group)
+        
+        # 2. Tracking & Filtering configuration
+        tracking_group = QGroupBox("BÁM VẾT & BỘ LỌC MƯỢT 3D (TRACKING)")
+        tracking_grid = QGridLayout(tracking_group)
+        
+        self.chk_enable_smoothing = QCheckBox("Kích hoạt bộ lọc mượt 3D (EMA)")
+        self.chk_enable_smoothing.setChecked(True)
+        tracking_grid.addWidget(self.chk_enable_smoothing, 0, 0, 1, 2)
+        
+        tracking_grid.addWidget(QLabel("Độ phản hồi bộ lọc (Alpha):"), 1, 0)
+        self.sb_filter_alpha = QDoubleSpinBox()
+        self.sb_filter_alpha.setRange(0.01, 1.0)
+        self.sb_filter_alpha.setValue(0.70)
+        self.sb_filter_alpha.setSingleStep(0.05)
+        tracking_grid.addWidget(self.sb_filter_alpha, 1, 1)
+        
+        self.chk_enable_keep_alive = QCheckBox("Duy trì trạng thái khi mất dấu tạm thời")
+        self.chk_enable_keep_alive.setChecked(True)
+        tracking_grid.addWidget(self.chk_enable_keep_alive, 2, 0, 1, 2)
+        
+        tracking_grid.addWidget(QLabel("Khung hình duy trì tối đa (Max Lost):"), 3, 0)
+        self.sb_max_lost_frames = QSpinBox()
+        self.sb_max_lost_frames.setRange(1, 100)
+        self.sb_max_lost_frames.setValue(15)
+        tracking_grid.addWidget(self.sb_max_lost_frames, 3, 1)
+        
+        tracking_grid.addWidget(QLabel("Độ dài bộ lọc trung bình (khung hình):"), 4, 0)
+        self.sb_window_size = QSpinBox()
+        self.sb_window_size.setRange(1, 1000)
+        self.sb_window_size.setValue(100) # default window size of 100 frames
+        tracking_grid.addWidget(self.sb_window_size, 4, 1)
+        
+        layout.addWidget(tracking_group)
+        
+        # 3. Dialog buttons
+        buttons_layout = QHBoxLayout()
+        self.btn_ok = QPushButton("Đóng")
+        self.btn_ok.setObjectName("btn_start")
+        self.btn_ok.clicked.connect(self.accept)
+        
+        buttons_layout.addStretch()
+        buttons_layout.addWidget(self.btn_ok)
+        layout.addLayout(buttons_layout)
+
+        # Style setting dialog similarly to main app widgets
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1a1a1a;
+            }
+            QLabel {
+                color: #d1d1d1;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #2d2d2d;
+                border-radius: 8px;
+                margin-top: 15px;
+                padding-top: 15px;
+                background-color: #222222;
+                color: #00e5ff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 10px;
+                padding: 0 6px;
+                color: #00e5ff;
+                font-size: 12px;
+                text-transform: uppercase;
+            }
+            QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+                background-color: #2c2c2c;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 5px;
+                color: #ffffff;
+            }
+            QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {
+                border: 1px solid #00e5ff;
+            }
+            QPushButton {
+                background-color: #00c853;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #00e676;
+            }
+        """)
+
+        # Connect signals for real-time update
+        if parent and hasattr(parent, 'push_config_to_worker'):
+            self.sb_tag_size.valueChanged.connect(parent.push_config_to_worker)
+            self.sb_source_id.valueChanged.connect(parent.push_config_to_worker)
+            self.txt_target_ids.textChanged.connect(parent.push_config_to_worker)
+            self.cb_coord_mode.currentIndexChanged.connect(parent.push_config_to_worker)
+            self.chk_enable_smoothing.stateChanged.connect(parent.push_config_to_worker)
+            self.sb_filter_alpha.valueChanged.connect(parent.push_config_to_worker)
+            self.chk_enable_keep_alive.stateChanged.connect(parent.push_config_to_worker)
+            self.sb_max_lost_frames.valueChanged.connect(parent.push_config_to_worker)
+            self.sb_window_size.valueChanged.connect(parent.push_config_to_worker)
+
+
 class GroundTruthApp(QMainWindow):
     def __init__(self):
         super().__init__()
         
         self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - Intel RealSense D455")
         self.setMinimumSize(1200, 850) # Increased height to accommodate the plot comfortably
+        
+        # Initialize settings dialog
+        self.settings_dialog = SettingsDialog(self)
         
         # Initialize thread
         self.worker = CameraWorker()
@@ -593,6 +758,13 @@ class GroundTruthApp(QMainWindow):
         self.apply_stylesheet()
         
     def init_ui(self):
+        # Tạo Menu Bar
+        menu_bar = self.menuBar()
+        settings_menu = menu_bar.addMenu("Cài đặt")
+        
+        settings_action = settings_menu.addAction("Cấu hình hệ thống...")
+        settings_action.triggered.connect(self.show_settings_dialog)
+
         # Main central widget
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
@@ -644,94 +816,23 @@ class GroundTruthApp(QMainWindow):
         stream_group = QGroupBox("ĐIỀU KHIỂN THIẾT BỊ")
         stream_grid = QGridLayout(stream_group)
         
+        self.btn_scan = QPushButton("Quét Thiết Bị (Scan)")
+        self.btn_scan.setObjectName("btn_normal")
+        self.btn_scan.clicked.connect(self.scan_devices)
+        stream_grid.addWidget(self.btn_scan, 0, 0, 1, 2)
+        
         self.btn_start = QPushButton("Bắt Đầu Truyền Hình")
         self.btn_start.setObjectName("btn_start")
         self.btn_start.clicked.connect(self.start_camera_stream)
-        stream_grid.addWidget(self.btn_start, 0, 0)
+        stream_grid.addWidget(self.btn_start, 1, 0)
         
         self.btn_stop = QPushButton("Dừng Truyền Hình")
         self.btn_stop.setObjectName("btn_stop")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_camera_stream)
-        stream_grid.addWidget(self.btn_stop, 0, 1)
+        stream_grid.addWidget(self.btn_stop, 1, 1)
         
         right_layout.addWidget(stream_group)
-        
-        # 2. Config parameters group
-        config_group = QGroupBox("CẤU HÌNH PHÁT HIỆN & THỐNG KÊ")
-        config_grid = QGridLayout(config_group)
-        
-        # Tag size in mm
-        config_grid.addWidget(QLabel("Kích thước AprilTag (mm):"), 0, 0)
-        self.sb_tag_size = QDoubleSpinBox()
-        self.sb_tag_size.setRange(1.0, 1000.0)
-        self.sb_tag_size.setValue(150.0) # default 150mm
-        self.sb_tag_size.setSuffix(" mm")
-        self.sb_tag_size.valueChanged.connect(self.push_config_to_worker)
-        config_grid.addWidget(self.sb_tag_size, 0, 1)
-        
-        # Source tag ID (ID 1)
-        config_grid.addWidget(QLabel("AprilTag ID Nguồn (Gốc):"), 1, 0)
-        self.sb_source_id = QSpinBox()
-        self.sb_source_id.setRange(0, 1000)
-        self.sb_source_id.setValue(1) # Default ID 1
-        self.sb_source_id.valueChanged.connect(self.push_config_to_worker)
-        config_grid.addWidget(self.sb_source_id, 1, 1)
-        
-        # Target tag IDs
-        config_grid.addWidget(QLabel("ID Đường Mục Tiêu (Ngăn cách bằng dấu phẩy):"), 2, 0)
-        self.txt_target_ids = QLineEdit()
-        self.txt_target_ids.setPlaceholderText("Trống: Dùng tất cả tag khác")
-        self.txt_target_ids.textChanged.connect(self.push_config_to_worker)
-        config_grid.addWidget(self.txt_target_ids, 2, 1)
-        
-        # Coordinate calculation mode
-        config_grid.addWidget(QLabel("Thuật toán tọa độ 3D:"), 3, 0)
-        self.cb_coord_mode = QComboBox()
-        self.cb_coord_mode.addItem("Sử dụng SolvePnP hình học (Khuyên dùng)", "pnp")
-        self.cb_coord_mode.addItem("Sử dụng Cảm biến Depth RealSense trực tiếp", "depth")
-        self.cb_coord_mode.currentIndexChanged.connect(self.push_config_to_worker)
-        config_grid.addWidget(self.cb_coord_mode, 3, 1)
-        
-        right_layout.addWidget(config_group)
-        
-        # 2.5 Tracking & Filtering configuration
-        tracking_group = QGroupBox("BÁM VẾT & BỘ LỌC MƯỢT 3D (TRACKING)")
-        tracking_grid = QGridLayout(tracking_group)
-        
-        self.chk_enable_smoothing = QCheckBox("Kích hoạt bộ lọc mượt 3D (EMA)")
-        self.chk_enable_smoothing.setChecked(True)
-        self.chk_enable_smoothing.stateChanged.connect(self.push_config_to_worker)
-        tracking_grid.addWidget(self.chk_enable_smoothing, 0, 0, 1, 2)
-        
-        tracking_grid.addWidget(QLabel("Độ phản hồi bộ lọc (Alpha):"), 1, 0)
-        self.sb_filter_alpha = QDoubleSpinBox()
-        self.sb_filter_alpha.setRange(0.01, 1.0)
-        self.sb_filter_alpha.setValue(0.30)
-        self.sb_filter_alpha.setSingleStep(0.05)
-        self.sb_filter_alpha.valueChanged.connect(self.push_config_to_worker)
-        tracking_grid.addWidget(self.sb_filter_alpha, 1, 1)
-        
-        self.chk_enable_keep_alive = QCheckBox("Duy trì trạng thái khi mất dấu tạm thời")
-        self.chk_enable_keep_alive.setChecked(True)
-        self.chk_enable_keep_alive.stateChanged.connect(self.push_config_to_worker)
-        tracking_grid.addWidget(self.chk_enable_keep_alive, 2, 0, 1, 2)
-        
-        tracking_grid.addWidget(QLabel("Khung hình duy trì tối đa (Max Lost):"), 3, 0)
-        self.sb_max_lost_frames = QSpinBox()
-        self.sb_max_lost_frames.setRange(1, 100)
-        self.sb_max_lost_frames.setValue(15)
-        self.sb_max_lost_frames.valueChanged.connect(self.push_config_to_worker)
-        tracking_grid.addWidget(self.sb_max_lost_frames, 3, 1)
-        
-        tracking_grid.addWidget(QLabel("Độ dài bộ lọc trung bình (khung hình):"), 4, 0)
-        self.sb_window_size = QSpinBox()
-        self.sb_window_size.setRange(1, 100)
-        self.sb_window_size.setValue(10) # default window size of 10 frames (~0.3s)
-        self.sb_window_size.valueChanged.connect(self.push_config_to_worker)
-        tracking_grid.addWidget(self.sb_window_size, 4, 1)
-        
-        right_layout.addWidget(tracking_group)
         
         # 3. Measurements cards (large display)
         measure_group = QGroupBox("KẾT QUẢ ĐO KHOẢNG CÁCH")
@@ -786,6 +887,9 @@ class GroundTruthApp(QMainWindow):
         right_layout.addWidget(logger_group)
         
         main_layout.addLayout(right_layout, 1)
+
+    def show_settings_dialog(self):
+        self.settings_dialog.exec()
         
     def apply_stylesheet(self):
         qss = """
@@ -942,26 +1046,66 @@ class GroundTruthApp(QMainWindow):
         self.setStyleSheet(qss)
         
     def push_config_to_worker(self):
-        tag_size = self.sb_tag_size.value() / 1000.0 # Convert mm to meters
-        source_id = self.sb_source_id.value()
-        target_ids = self.txt_target_ids.text()
-        coord_mode = self.cb_coord_mode.currentData()
+        tag_size = self.settings_dialog.sb_tag_size.value() / 1000.0 # Convert mm to meters
+        source_id = self.settings_dialog.sb_source_id.value()
+        target_ids = self.settings_dialog.txt_target_ids.text()
+        coord_mode = self.settings_dialog.cb_coord_mode.currentData()
         
         # Read tracking settings
-        filter_alpha = self.sb_filter_alpha.value()
-        max_lost_frames = self.sb_max_lost_frames.value()
-        enable_smoothing = self.chk_enable_smoothing.isChecked()
-        enable_keep_alive = self.chk_enable_keep_alive.isChecked()
-        window_size = self.sb_window_size.value()
+        filter_alpha = self.settings_dialog.sb_filter_alpha.value()
+        max_lost_frames = self.settings_dialog.sb_max_lost_frames.value()
+        enable_smoothing = self.settings_dialog.chk_enable_smoothing.isChecked()
+        enable_keep_alive = self.settings_dialog.chk_enable_keep_alive.isChecked()
+        window_size = self.settings_dialog.sb_window_size.value()
         
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size)
         
+    def scan_devices(self):
+        self.status_bar_lbl.setText("Đang quét thiết bị camera...")
+        QApplication.processEvents()
+        try:
+            ctx = rs.context()
+            devices = ctx.query_devices()
+            if len(devices) == 0:
+                self.status_bar_lbl.setText("Không tìm thấy camera RealSense.")
+                QMessageBox.warning(self, "Quét Thiết Bị", 
+                                    "Không phát hiện thấy camera Intel RealSense nào đang kết nối.\n"
+                                    "Vui lòng kiểm tra lại cáp kết nối USB 3.0 và đảm bảo camera đã được cắm.")
+            else:
+                dev_list = []
+                for i, dev in enumerate(devices):
+                    name = dev.get_info(rs.camera_info.name)
+                    sn = dev.get_info(rs.camera_info.serial_number)
+                    dev_list.append(f"• {name} (S/N: {sn})")
+                
+                self.status_bar_lbl.setText(f"Đã tìm thấy {len(devices)} thiết bị.")
+                devs_text = "\n".join(dev_list)
+                QMessageBox.information(self, "Quét Thiết Bị", 
+                                        f"Đã phát hiện thấy {len(devices)} thiết bị RealSense kết nối:\n\n{devs_text}")
+        except Exception as e:
+            self.status_bar_lbl.setText("Lỗi khi quét thiết bị.")
+            QMessageBox.critical(self, "Lỗi Quét Thiết Bị", f"Lỗi xảy ra trong quá trình quét: {str(e)}")
+
     def start_camera_stream(self):
+        # Kiểm tra thiết bị RealSense trước để tránh treo app
+        try:
+            ctx = rs.context()
+            devices = ctx.query_devices()
+            if len(devices) == 0:
+                QMessageBox.warning(self, "Không tìm thấy camera", 
+                                    "Không thể bắt đầu. Không phát hiện thấy camera Intel RealSense nào đang kết nối.\n"
+                                    "Vui lòng kiểm tra lại cáp cắm và thử lại.")
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi kiểm tra camera", f"Có lỗi xảy ra khi kiểm tra camera: {str(e)}")
+            return
+
         self.push_config_to_worker()
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
-        self.sb_source_id.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.settings_dialog.sb_source_id.setEnabled(False)
         
         self.worker.start()
         
@@ -984,7 +1128,8 @@ class GroundTruthApp(QMainWindow):
         self.curve_poly.setData([], [])
         
         self.btn_start.setEnabled(True)
-        self.sb_source_id.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        self.settings_dialog.sb_source_id.setEnabled(True)
         
     def select_log_file(self):
         desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")

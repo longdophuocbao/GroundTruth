@@ -11,8 +11,8 @@ Dự án này cung cấp một giải pháp phần mềm hoàn chỉnh và trự
     *   **Bộ lọc mượt EMA (Exponential Moving Average)**: Giảm thiểu hiện tượng rung sai số (jitter) trong tọa độ 3D và góc xoay.
     *   **Cơ chế Keep-Alive**: Duy trì bám vết và nội suy vị trí của thẻ tag ngay cả khi bị che khuất tạm thời (trong khoảng số lượng khung hình định trước).
 *   **Hai thuật toán tính toán tọa độ 3D linh hoạt**:
-    1.  **SolvePnP hình học**: Sử dụng thông số nội tại (Camera Intrinsics) của camera màu RealSense kết hợp kích thước thực tế của tag để giải bài toán Pose Estimation. (Được khuyên dùng cho độ chính xác cao).
-    2.  **Cảm biến Depth RealSense**: Lấy trực tiếp dữ liệu khoảng cách chiều sâu tại vùng tâm thẻ tag và chiếu ngược (deproject) sang hệ tọa độ 3D.
+    1.  **Cảm biến Depth RealSense (Mặc định)**: Lấy trực tiếp dữ liệu khoảng cách chiều sâu tại vùng tâm thẻ tag và chiếu ngược (deproject) sang hệ tọa độ 3D.
+    2.  **SolvePnP hình học**: Sử dụng thông số nội tại (Camera Intrinsics) của camera màu RealSense kết hợp kích thước thực tế của tag để giải bài toán Pose Estimation.
 *   **Đo khoảng cách đến đường gấp khúc (Polyline)**: Tính toán khoảng cách vuông góc ngắn nhất từ vị trí thẻ Nguồn (Source) đến đường dẫn tạo bởi chuỗi thẻ Mục tiêu (Targets) trong không gian 3D.
 *   **Giao diện đồ họa (GUI) trực quan & hiện đại**: 
     *   Xây dựng bằng **PySide6 (Qt for Python)** với giao diện tối (Dark Mode) cao cấp.
@@ -70,21 +70,43 @@ python GroundTruth.py
 ```
 
 ### Bước 3: Cấu hình trên giao diện
-1.  **Kích thước AprilTag**: Nhập kích thước thực tế của viền đen ngoài cùng thẻ tag (tính bằng milimet, ví dụ: `150.0 mm`).
-2.  **AprilTag ID Nguồn**: Nhập ID của thẻ tag di động cần đo khoảng cách (mặc định là `1`).
-3.  **ID Đường Mục Tiêu**: Nhập danh sách ID các tag cố định tạo nên đường dẫn, cách nhau bằng dấu phẩy (ví dụ: `0,3`). Nếu để trống, hệ thống tự động nhận tất cả các tag khác làm mục tiêu.
-4.  **Thuật toán tọa độ 3D**: Chọn giữa `SolvePnP` hoặc `Depth Sensor`.
-5.  **Cấu hình bộ lọc (Tracking)**:
+1.  **Mở Hộp Thoại Cài Đặt**: Trên thanh công cụ, nhấn vào menu **Cài đặt** -> chọn **Cấu hình hệ thống...**. Hộp thoại cài đặt sẽ xuất hiện và cho phép điều chỉnh mọi thông số của hệ thống trực tiếp (real-time).
+2.  **Kích thước AprilTag**: Nhập kích thước thực tế của viền đen ngoài cùng thẻ tag (tính bằng milimet, ví dụ: `150.0 mm`).
+3.  **AprilTag ID Nguồn**: Nhập ID của thẻ tag di động cần đo khoảng cách (mặc định là `1`).
+4.  **ID Đường Mục Tiêu**: Nhập danh sách ID các tag cố định tạo nên đường dẫn, cách nhau bằng dấu phẩy (ví dụ: `0,3`). Nếu để trống, hệ thống tự động nhận tất cả các tag khác làm mục tiêu.
+5.  **Thuật toán tọa độ 3D**: Chọn giữa `Sử dụng Cảm biến Depth RealSense trực tiếp (Mặc định)` hoặc `Sử dụng SolvePnP hình học`.
+6.  **Cấu hình bộ lọc (Tracking)**:
     *   *Kích hoạt bộ lọc mượt 3D (EMA)* để giảm nhiễu giật hình ảnh.
     *   *Khung hình duy trì tối đa (Max Lost)*: Số lượng khung hình mà hệ thống vẫn duy trì vị trí cũ của tag sau khi tag bị che khuất trước khi đánh dấu là mất kết nối.
     *   *Độ dài bộ lọc trung bình (Window Size)*: Số lượng khung hình dùng để tính toán trung bình trượt cho khoảng cách đo được hiển thị trên đồ thị.
 
 ### Bước 4: Vận hành và ghi nhật ký
-1.  Nhấn nút **Bắt Đầu Truyền Hình** để bắt đầu nhận luồng video từ camera RealSense.
-2.  **Ghi nhật ký CSV (Tùy chọn)**:
+1.  Nhấn nút **Quét Thiết Bị (Scan)** trên giao diện chính để kiểm tra số lượng và thông tin chi tiết camera Intel RealSense đang kết nối.
+2.  Nhấn nút **Bắt Đầu Truyền Hình** để bắt đầu nhận luồng video từ camera RealSense.
+3.  **Ghi nhật ký CSV (Tùy chọn)**:
     *   Nhấn **Chọn File Lưu...** để tạo đường dẫn và tên tệp CSV (mặc định lưu ra màn hình Desktop).
     *   Tích chọn **Bật ghi nhật ký trực tiếp** để bắt đầu lưu dữ liệu. Có thể nhấn bỏ tích để tạm dừng ghi.
-3.  Nhấn **Dừng Truyền Hình** khi kết thúc quá trình đo đạc.
+4.  Nhấn **Dừng Truyền Hình** khi kết thúc quá trình đo đạc.
+
+---
+
+## 📦 Biên Dịch Ra File Thực Thi (.exe)
+
+Nếu bạn muốn đóng gói ứng dụng thành một tệp `.exe` độc lập để chạy trên các máy tính khác mà không cần cài đặt môi trường Python, bạn có thể biên dịch bằng công cụ **Nuitka**.
+
+### 1. Cài đặt Nuitka
+Cài đặt Nuitka từ pip:
+```bash
+pip install nuitka
+```
+
+### 2. Lệnh biên dịch ứng dụng
+Chạy lệnh sau trong thư mục chứa dự án để biên dịch sang tệp `.exe` duy nhất (đã tối ưu hóa cho PySide6, OpenCV, RealSense, và tự động ẩn cửa sổ Console màu đen khi khởi chạy):
+```bash
+python -m nuitka --standalone --onefile --enable-plugin=pyside6 --enable-plugin=numpy --windows-console-mode=disable --include-package=pyrealsense2 --assume-yes-for-downloads GroundTruth.py
+```
+
+Sau khi quá trình biên dịch hoàn thành, tệp thực thi `GroundTruth.exe` sẽ được tạo ra tại thư mục dự án của bạn.
 
 ---
 
