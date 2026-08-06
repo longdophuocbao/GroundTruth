@@ -1,0 +1,1137 @@
+import os
+import sys
+import time
+import csv
+from datetime import datetime
+import numpy as np
+import cv2
+import pyrealsense2 as rs
+import pyqtgraph as pg
+
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex, QMutexLocker
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
+                             QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, 
+                             QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, 
+                             QGroupBox, QComboBox, QFileDialog, QMessageBox, QCheckBox,
+                             QDoubleSpinBox, QSpinBox)
+from PySide6.QtGui import QImage, QPixmap, QFont, QColor
+
+class TagTracker:
+    def __init__(self, tag_id, alpha=0.3, max_lost_frames=15):
+        self.tag_id = tag_id
+        self.alpha = alpha
+        self.max_lost_frames = max_lost_frames
+        
+        self.pos_pnp_filtered = None
+        self.pos_depth_filtered = None
+        self.corners_filtered = None
+        self.rvec_filtered = None
+        self.tvec_filtered = None
+        
+        self.lost_frames = 0
+        self.is_tracked = False
+
+    def update(self, corners, pos_pnp, pos_depth, rvec, tvec, alpha=0.3, max_lost_frames=15):
+        self.alpha = alpha
+        self.max_lost_frames = max_lost_frames
+        self.lost_frames = 0
+        self.is_tracked = True
+        
+        if self.pos_pnp_filtered is None:
+            self.pos_pnp_filtered = np.array(pos_pnp, dtype=np.float32)
+            self.pos_depth_filtered = np.array(pos_depth, dtype=np.float32)
+            self.corners_filtered = np.array(corners, dtype=np.float32)
+            self.rvec_filtered = np.array(rvec, dtype=np.float32) if rvec is not None else None
+            self.tvec_filtered = np.array(tvec, dtype=np.float32) if tvec is not None else None
+        else:
+            self.pos_pnp_filtered = self.alpha * np.array(pos_pnp, dtype=np.float32) + (1.0 - self.alpha) * self.pos_pnp_filtered
+            self.pos_depth_filtered = self.alpha * np.array(pos_depth, dtype=np.float32) + (1.0 - self.alpha) * self.pos_depth_filtered
+            self.corners_filtered = self.alpha * np.array(corners, dtype=np.float32) + (1.0 - self.alpha) * self.corners_filtered
+            
+            if rvec is not None and self.rvec_filtered is not None:
+                self.rvec_filtered = self.alpha * np.array(rvec, dtype=np.float32) + (1.0 - self.alpha) * self.rvec_filtered
+            elif rvec is not None:
+                self.rvec_filtered = np.array(rvec, dtype=np.float32)
+                
+            if tvec is not None and self.tvec_filtered is not None:
+                self.tvec_filtered = self.alpha * np.array(tvec, dtype=np.float32) + (1.0 - self.alpha) * self.tvec_filtered
+            elif tvec is not None:
+                self.tvec_filtered = np.array(tvec, dtype=np.float32)
+
+    def predict(self, max_lost_frames=15):
+        self.max_lost_frames = max_lost_frames
+        self.lost_frames += 1
+        if self.lost_frames >= self.max_lost_frames:
+            self.is_tracked = False
+
+class CameraWorker(QThread):
+    frame_ready = Signal(np.ndarray, dict) # Emits the annotated BGR/RGB frame and results dictionary
+    error_occurred = Signal(str)
+    status_msg = Signal(str)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.running = False
+        self._mutex = QMutex()
+        
+        # Thread-safe config parameters
+        self._tag_size = 0.150 # meters (150mm)
+        self._source_id = 1
+        self._target_ids_str = ""
+        self._coord_mode = "pnp" # "pnp" or "depth"
+        
+        # Tracking config
+        self._filter_alpha = 0.3
+        self._max_lost_frames = 15
+        self._enable_smoothing = True
+        self._enable_keep_alive = True
+        
+        self._trackers = {}
+        self._distance_history = []
+        self._window_size = 10
+        
+        # Logger state
+        self._log_file_path = ""
+        self._is_logging = False
+        self._log_file = None
+        self._log_writer = None
+        self._log_start_time = 0.0
+
+    # Thread-safe getters/setters
+    def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
+                      filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size):
+        with QMutexLocker(self._mutex):
+            self._tag_size = tag_size
+            self._source_id = source_id
+            self._target_ids_str = target_ids_str
+            self._coord_mode = coord_mode
+            self._filter_alpha = filter_alpha
+            self._max_lost_frames = max_lost_frames
+            self._enable_smoothing = enable_smoothing
+            self._enable_keep_alive = enable_keep_alive
+            self._window_size = window_size
+
+    def start_logging(self, file_path):
+        with QMutexLocker(self._mutex):
+            try:
+                self._log_file_path = file_path
+                # Open CSV and write header
+                self._log_file = open(file_path, mode='w', newline='', encoding='utf-8')
+                self._log_writer = csv.writer(self._log_file)
+                self._log_writer.writerow([
+                    "Timestamp_Sec", "Time_Formatted", 
+                    "Source_ID", "Source_X_mm", "Source_Y_mm", "Source_Z_mm",
+                    "Num_Targets", "Polyline_Dist_mm",
+                    "Target_IDs", "Selected_Coord_Mode"
+                ])
+                self._is_logging = True
+                self._log_start_time = time.time()
+                return True
+            except Exception as e:
+                self._is_logging = False
+                if self._log_file:
+                    self._log_file.close()
+                    self._log_file = None
+                raise e
+
+    def stop_logging(self):
+        with QMutexLocker(self._mutex):
+            self._is_logging = False
+            if self._log_file:
+                self._log_file.close()
+                self._log_file = None
+            self._log_file_path = ""
+
+    def run(self):
+        self.running = True
+        self.status_msg.emit("Đang khởi tạo camera RealSense...")
+        
+        # Create pipeline and config
+        pipeline = rs.pipeline()
+        config = rs.config()
+        
+        # Configure streams (D455 supports 640x480 for color and depth)
+        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        
+        align = rs.align(rs.stream.color)
+        
+        try:
+            profile = pipeline.start(config)
+            self.status_msg.emit("Đang kết nối. Pipeline bắt đầu hoạt động.")
+        except Exception as e:
+            self.error_occurred.emit(f"Không thể khởi động camera: {str(e)}")
+            self.running = False
+            return
+            
+        try:
+            # Retrieve camera intrinsics
+            color_stream = profile.get_stream(rs.stream.color)
+            intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
+            
+            cam_matrix = np.array([
+                [intrinsics.fx, 0, intrinsics.ppx],
+                [0, intrinsics.fy, intrinsics.ppy],
+                [0, 0, 1]
+            ], dtype=np.float32)
+            dist_coeffs = np.array(intrinsics.coeffs, dtype=np.float32)
+            
+            # Initialize AprilTag detector (using Aruco module in OpenCV 5)
+            dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+            parameters = cv2.aruco.DetectorParameters()
+            detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+            
+            # Wait for sensors to warm up/auto-exposure to stabilize
+            for _ in range(10):
+                if not self.running:
+                    break
+                pipeline.wait_for_frames()
+                
+            self.status_msg.emit("Camera đang phát truyền hình trực tiếp.")
+            
+            # Reset trackers and history
+            self._trackers = {}
+            self._distance_history.clear()
+            
+            while self.running:
+                frames = pipeline.wait_for_frames()
+                
+                # Align depth frame to color frame
+                aligned_frames = align.process(frames)
+                color_frame = aligned_frames.get_color_frame()
+                depth_frame = aligned_frames.get_depth_frame()
+                
+                if not color_frame or not depth_frame:
+                    continue
+                    
+                # Convert frames to numpy arrays
+                color_image = np.asanyarray(color_frame.get_data())
+                
+                # Read latest config variables in a thread-safe way
+                with QMutexLocker(self._mutex):
+                    tag_size = self._tag_size
+                    source_id = self._source_id
+                    target_ids_str = self._target_ids_str
+                    coord_mode = self._coord_mode
+                    is_logging = self._is_logging
+                    filter_alpha = self._filter_alpha
+                    max_lost_frames = self._max_lost_frames
+                    enable_smoothing = self._enable_smoothing
+                    enable_keep_alive = self._enable_keep_alive
+                
+                # Grayscale for AprilTag detection
+                gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                corners, ids, rejected = detector.detectMarkers(gray)
+                
+                # Setup 3D points for pose estimation (PnP)
+                s = tag_size
+                obj_points = np.array([
+                    [-s/2, -s/2, 0], # Top-Left
+                    [ s/2, -s/2, 0], # Top-Right
+                    [ s/2,  s/2, 0], # Bottom-Right
+                    [-s/2,  s/2, 0]  # Bottom-Left
+                ], dtype=np.float32)
+                
+                detected_this_frame = set()
+                detected_tags_raw = {}
+                
+                if ids is not None:
+                    flat_ids = np.ravel(ids)
+                    for i, tag_id_val in enumerate(flat_ids):
+                        tag_id = int(tag_id_val)
+                        corners_i = np.array(corners[i], dtype=np.float32).reshape(4, 2)
+                        
+                        # Calculate 2D center
+                        u_c = float(np.mean(corners_i[:, 0]))
+                        v_c = float(np.mean(corners_i[:, 1]))
+                        
+                        # Solve PnP
+                        success, rvec, tvec = cv2.solvePnP(obj_points, corners_i, cam_matrix, dist_coeffs)
+                        if success:
+                            p_3d_pnp = tvec.flatten()
+                        else:
+                            p_3d_pnp = np.array([0.0, 0.0, 0.0])
+                            rvec, tvec = None, None
+                        
+                        # Retrieve 3D point via Depth sensor
+                        depth_val = 0.0
+                        h, w = depth_frame.get_height(), depth_frame.get_width()
+                        depths = []
+                        for dy in range(-2, 3):
+                            for dx in range(-2, 3):
+                                nu, nv = int(u_c) + dx, int(v_c) + dy
+                                if 0 <= nu < w and 0 <= nv < h:
+                                    d = depth_frame.get_distance(nu, nv)
+                                    if d > 0.0:
+                                        depths.append(d)
+                        if depths:
+                            depth_val = float(np.median(depths))
+                            
+                        # Deproject depth-based center
+                        if depth_val > 0.0:
+                            p_3d_depth = np.array(rs.rs2_deproject_pixel_to_point(intrinsics, [u_c, v_c], depth_val))
+                        else:
+                            p_3d_depth = np.array([0.0, 0.0, 0.0])
+                            
+                        detected_tags_raw[tag_id] = {
+                            'corners': corners_i,
+                            'center_2d': (u_c, v_c),
+                            'rvec': rvec,
+                            'tvec': tvec,
+                            'pos_pnp': p_3d_pnp,
+                            'pos_depth': p_3d_depth,
+                            'depth': depth_val
+                        }
+                        
+                        # Update or create tracker
+                        if tag_id not in self._trackers:
+                            self._trackers[tag_id] = TagTracker(tag_id, alpha=filter_alpha, max_lost_frames=max_lost_frames)
+                        
+                        self._trackers[tag_id].update(corners_i, p_3d_pnp, p_3d_depth, rvec, tvec, 
+                                                      alpha=filter_alpha, max_lost_frames=max_lost_frames)
+                        detected_this_frame.add(tag_id)
+                
+                # Predict for trackers not detected in this frame
+                for tid, tracker in list(self._trackers.items()):
+                    if tid not in detected_this_frame:
+                        tracker.predict(max_lost_frames=max_lost_frames)
+                        
+                # Filter active tags for calculations and drawing
+                active_tags = {}
+                for tid, tracker in self._trackers.items():
+                    if not tracker.is_tracked:
+                        continue
+                    if not enable_keep_alive and tracker.lost_frames > 0:
+                        continue
+                        
+                    # Choose raw or filtered values
+                    if enable_smoothing:
+                        pos_pnp = tracker.pos_pnp_filtered
+                        pos_depth = tracker.pos_depth_filtered
+                        corners_i = tracker.corners_filtered
+                        rvec = tracker.rvec_filtered
+                        tvec = tracker.tvec_filtered
+                    else:
+                        if tracker.lost_frames == 0 and tid in detected_tags_raw:
+                            raw = detected_tags_raw[tid]
+                            pos_pnp = raw['pos_pnp']
+                            pos_depth = raw['pos_depth']
+                            corners_i = raw['corners']
+                            rvec = raw['rvec']
+                            tvec = raw['tvec']
+                        else:
+                            pos_pnp = tracker.pos_pnp_filtered
+                            pos_depth = tracker.pos_depth_filtered
+                            corners_i = tracker.corners_filtered
+                            rvec = tracker.rvec_filtered
+                            tvec = tracker.tvec_filtered
+                            
+                    active_tags[tid] = {
+                        'corners': corners_i,
+                        'center_2d': (float(np.mean(corners_i[:, 0])), float(np.mean(corners_i[:, 1]))),
+                        'rvec': rvec,
+                        'tvec': tvec,
+                        'pos_pnp': pos_pnp,
+                        'pos_depth': pos_depth,
+                        'lost_frames': tracker.lost_frames
+                    }
+                
+                # Process measurements
+                results = {
+                    'detected_tags': {},
+                    'source_detected': False,
+                    'num_targets': 0,
+                    'polyline_dist': None,
+                    'fitted_line_dist': None,
+                    'selected_mode': coord_mode
+                }
+                
+                # Check for source tag
+                source_pos = None
+                if source_id in active_tags:
+                    results['source_detected'] = True
+                    src_tag = active_tags[source_id]
+                    source_pos = src_tag['pos_pnp'] if coord_mode == 'pnp' else src_tag['pos_depth']
+                
+                # Parse target IDs
+                target_ids = []
+                if target_ids_str.strip() == "":
+                    target_ids = [tid for tid in sorted(active_tags.keys()) if tid != source_id]
+                else:
+                    try:
+                        parsed_ids = [int(x.strip()) for x in target_ids_str.split(",") if x.strip().isdigit()]
+                        target_ids = [tid for tid in parsed_ids if tid in active_tags]
+                    except Exception:
+                        target_ids = [tid for tid in sorted(active_tags.keys()) if tid != source_id]
+
+                # Map detected tag details to results
+                for tid, tag in active_tags.items():
+                    role = "Nguồn" if tid == source_id else ("Đường mục tiêu" if tid in target_ids else "Không sử dụng")
+                    status_text = "Đang phát hiện" if tag['lost_frames'] == 0 else f"Bám vết (mất {tag['lost_frames']}f)"
+                    results['detected_tags'][tid] = {
+                        'pos_pnp': tag['pos_pnp'] * 1000.0,
+                        'pos_depth': tag['pos_depth'] * 1000.0,
+                        'role': role,
+                        'status': status_text,
+                        'lost_frames': tag['lost_frames']
+                    }
+
+                # Extract 3D points of targets
+                target_pts = []
+                for tid in target_ids:
+                    tag = active_tags[tid]
+                    pos = tag['pos_pnp'] if coord_mode == 'pnp' else tag['pos_depth']
+                    target_pts.append(pos)
+                
+                results['num_targets'] = len(target_pts)
+                
+                # Draw tag boundaries and info
+                for tid, tag in active_tags.items():
+                    corners_i = tag['corners'].astype(np.int32)
+                    is_source = (tid == source_id)
+                    is_lost = tag['lost_frames'] > 0
+                    
+                    if is_lost:
+                        color = (0, 165, 255) # Orange for lost-but-tracked
+                        thickness = 1
+                    else:
+                        color = (0, 0, 255) if is_source else ((0, 255, 255) if tid in target_ids else (128, 128, 128))
+                        thickness = 3 if is_source or tid in target_ids else 1
+                    
+                    # Draw boundary
+                    if is_lost:
+                        self._draw_dashed_polygon(color_image, tag['corners'], color, thickness=1, dash_len=5)
+                    else:
+                        for k in range(4):
+                            cv2.line(color_image, tuple(corners_i[k]), tuple(corners_i[(k+1)%4]), color, thickness)
+                        
+                    # Write ID text
+                    cx, cy = int(tag['center_2d'][0]), int(tag['center_2d'][1])
+                    label_text = f"ID:{tid} (Lost)" if is_lost else f"ID:{tid}"
+                    cv2.putText(color_image, label_text, (cx - 25, cy - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1 if is_lost else 2, cv2.LINE_AA)
+                    
+                    # Draw 3D axis
+                    if not is_lost and tag['rvec'] is not None and tag['tvec'] is not None:
+                        cv2.drawFrameAxes(color_image, cam_matrix, dist_coeffs, 
+                                          tag['rvec'], tag['tvec'], length=tag_size * 0.5, thickness=2)
+                
+                # Compute distance to polyline if source and targets are detected
+                if source_pos is not None and len(target_pts) > 0:
+                    # Polyline distance
+                    poly_dist, poly_closest_3d = self._distance_point_to_polyline(source_pos, target_pts)
+                    if poly_dist is not None:
+                        raw_dist = poly_dist * 1000.0
+                        
+                        with QMutexLocker(self._mutex):
+                            w_size = self._window_size
+                        
+                        # Append raw distance to history
+                        self._distance_history.append(raw_dist)
+                        if len(self._distance_history) > w_size:
+                            self._distance_history.pop(0)
+                        
+                        # Compute moving average
+                        filtered_dist = sum(self._distance_history) / len(self._distance_history)
+                        results['polyline_dist'] = filtered_dist
+                        
+                        # Project polyline path to 2D
+                        self._draw_polyline(color_image, target_pts, cam_matrix, dist_coeffs)
+                        # Project and draw shortest path vector to polyline
+                        self._draw_distance_vector(color_image, source_pos, poly_closest_3d, 
+                                                   cam_matrix, dist_coeffs, (0, 255, 0), "Khoảng cách", filtered_dist)
+                else:
+                    self._distance_history.clear()
+                
+                # Log data if active
+                if is_logging:
+                    self._write_log_row(results, source_id, source_pos, target_ids)
+                
+                # Send frame and results to GUI
+                self.frame_ready.emit(color_image, results)
+                
+            pipeline.stop()
+            self.status_msg.emit("Đã dừng truyền hình. Camera ở trạng thái nghỉ.")
+            
+        except Exception as e:
+            self.error_occurred.emit(f"Lỗi trong vòng lặp xử lý: {str(e)}")
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            self.running = False
+
+    def _draw_dashed_polygon(self, image, corners, color, thickness=1, dash_len=5):
+        # corners is shape (4, 2)
+        for k in range(4):
+            pt1 = corners[k]
+            pt2 = corners[(k+1)%4]
+            dist = np.linalg.norm(pt1 - pt2)
+            if dist == 0:
+                continue
+            direction = (pt2 - pt1) / dist
+            num_dashes = int(dist / (2 * dash_len))
+            for i in range(num_dashes):
+                s_pt = pt1 + direction * (i * 2 * dash_len)
+                e_pt = pt1 + direction * ((i * 2 + 1) * dash_len)
+                cv2.line(image, (int(s_pt[0]), int(s_pt[1])), (int(e_pt[0]), int(e_pt[1])), color, thickness, cv2.LINE_AA)
+
+    # Mathematical algorithms for 3D distances
+    def _distance_point_to_segment(self, p, a, b):
+        ab = b - a
+        ap = p - a
+        ab_len_sq = np.dot(ab, ab)
+        if ab_len_sq == 0.0:
+            return np.linalg.norm(ap), a
+            
+        t = np.dot(ap, ab) / ab_len_sq
+        t = np.clip(t, 0.0, 1.0)
+        closest_point = a + t * ab
+        dist = np.linalg.norm(p - closest_point)
+        return dist, closest_point
+
+    def _distance_point_to_polyline(self, p, qs):
+        if len(qs) == 0:
+            return None, None
+        if len(qs) == 1:
+            dist = np.linalg.norm(p - qs[0])
+            return dist, qs[0]
+            
+        min_dist = float('inf')
+        best_closest = None
+        for i in range(len(qs) - 1):
+            dist, closest = self._distance_point_to_segment(p, qs[i], qs[i+1])
+            if dist < min_dist:
+                min_dist = dist
+                best_closest = closest
+        return min_dist, best_closest
+
+    # Drawing helpers
+    def _project_points_3d_to_2d(self, pts_3d, cam_matrix, dist_coeffs):
+        pts_3d = np.array(pts_3d, dtype=np.float32).reshape(-1, 3)
+        rvec = np.zeros(3, dtype=np.float32)
+        tvec = np.zeros(3, dtype=np.float32)
+        img_pts, _ = cv2.projectPoints(pts_3d, rvec, tvec, cam_matrix, dist_coeffs)
+        return img_pts.reshape(-1, 2)
+
+    def _draw_polyline(self, image, target_pts, cam_matrix, dist_coeffs):
+        if len(target_pts) < 1:
+            return
+        pts_2d = self._project_points_3d_to_2d(target_pts, cam_matrix, dist_coeffs)
+        
+        # Draw polyline segments
+        for k in range(len(pts_2d) - 1):
+            pt1 = (int(pts_2d[k][0]), int(pts_2d[k][1]))
+            pt2 = (int(pts_2d[k+1][0]), int(pts_2d[k+1][1]))
+            cv2.line(image, pt1, pt2, (255, 144, 30), 3, cv2.LINE_AA) # Rich light blue
+            
+        # Draw vertices
+        for pt in pts_2d:
+            cv2.circle(image, (int(pt[0]), int(pt[1])), 6, (0, 255, 255), -1)
+
+    def _draw_distance_vector(self, image, p_src, p_dst, cam_matrix, dist_coeffs, color, label, distance_mm):
+        proj_pts = self._project_points_3d_to_2d([p_src, p_dst], cam_matrix, dist_coeffs)
+        pt_src = (int(proj_pts[0][0]), int(proj_pts[0][1]))
+        pt_dst = (int(proj_pts[1][0]), int(proj_pts[1][1]))
+        
+        # Draw vector line with arrows/circles
+        cv2.line(image, pt_src, pt_dst, color, 2, cv2.LINE_AA)
+        cv2.circle(image, pt_src, 4, color, -1)
+        cv2.circle(image, pt_dst, 4, color, -1)
+        
+        # Overlay value text
+        mid_pt = (int((pt_src[0] + pt_dst[0]) / 2) + 15, int((pt_src[1] + pt_dst[1]) / 2) - 5)
+        cv2.putText(image, f"{label}: {distance_mm:.1f}mm", mid_pt,
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+    # Logger logic
+    def _write_log_row(self, results, source_id, source_pos, target_ids):
+        if not self._log_writer:
+            return
+        
+        elapsed = time.time() - self._log_start_time
+        timestamp_formatted = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        
+        src_coords = [f"{x*1000.0:.2f}" for x in source_pos] if source_pos is not None else ["N/A", "N/A", "N/A"]
+        
+        num_targets = results['num_targets']
+        poly_dist = f"{results['polyline_dist']:.2f}" if results['polyline_dist'] is not None else "N/A"
+        targets_str = ";".join(str(tid) for tid in target_ids) if target_ids else "None"
+        
+        try:
+            self._log_writer.writerow([
+                f"{elapsed:.4f}", timestamp_formatted,
+                source_id, src_coords[0], src_coords[1], src_coords[2],
+                num_targets, poly_dist,
+                targets_str, results['selected_mode']
+            ])
+            self._log_file.flush()
+        except Exception:
+            pass # ignore logger errors during thread run to keep camera stream active
+
+
+class GroundTruthApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - Intel RealSense D455")
+        self.setMinimumSize(1200, 850) # Increased height to accommodate the plot comfortably
+        
+        # Initialize thread
+        self.worker = CameraWorker()
+        self.worker.frame_ready.connect(self.update_frame)
+        self.worker.error_occurred.connect(self.handle_camera_error)
+        self.worker.status_msg.connect(self.update_status)
+        
+        # Plot data history
+        self.plot_time_history = []
+        self.plot_poly_history = []
+        self.plot_start_time = None
+        self.max_history_points = 300 # scrolling window size (e.g. 10s at 30fps)
+        
+        self.init_ui()
+        self.apply_stylesheet()
+        
+    def init_ui(self):
+        # Main central widget
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+        
+        # Main layout (Horizontal split: Left is view, Right is control panel)
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
+        
+        # Left Area: Title + Camera Feed + Real-time Plot
+        left_layout = QVBoxLayout()
+        
+        # Title bar
+        title_label = QLabel("CAMERA MONITOR & 3D DETECTIONS")
+        title_label.setObjectName("title_label")
+        left_layout.addWidget(title_label)
+        
+        # Label to display video frames
+        self.video_label = QLabel()
+        self.video_label.setAlignment(Qt.AlignCenter)
+        self.video_label.setText("Vui lòng nhấn 'Bắt Đầu Truyền Hình' để kết nối camera.")
+        self.video_label.setObjectName("lbl_video")
+        self.video_label.setMinimumSize(640, 400)
+        left_layout.addWidget(self.video_label, 3) # Stretch factor 3
+        
+        # Real-time Plot Widget using pyqtgraph
+        self.plot_widget = pg.PlotWidget()
+        self.plot_widget.setBackground('#1a1a1a')
+        self.plot_widget.setTitle("ĐỒ THỊ KHOẢNG CÁCH THEO THỜI GIAN (MM)", color='#00e5ff', size='10pt')
+        self.plot_widget.setLabel('left', 'Khoảng cách', units='mm', color='#d1d1d1')
+        self.plot_widget.setLabel('bottom', 'Thời gian', units='s', color='#d1d1d1')
+        self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
+        
+        # Plot curve
+        self.curve_poly = self.plot_widget.plot(pen=pg.mkPen(color='#00e676', width=2.5))
+        left_layout.addWidget(self.plot_widget, 2) # Stretch factor 2
+        
+        # Quick status bar inside left layout
+        self.status_bar_lbl = QLabel("Hệ thống đã sẵn sàng.")
+        self.status_bar_lbl.setObjectName("lbl_status_bar")
+        left_layout.addWidget(self.status_bar_lbl)
+        
+        main_layout.addLayout(left_layout, 2)
+        
+        # Right Area: Control Panel & Tables
+        right_layout = QVBoxLayout()
+        
+        # 1. Connection and Stream controls
+        stream_group = QGroupBox("ĐIỀU KHIỂN THIẾT BỊ")
+        stream_grid = QGridLayout(stream_group)
+        
+        self.btn_start = QPushButton("Bắt Đầu Truyền Hình")
+        self.btn_start.setObjectName("btn_start")
+        self.btn_start.clicked.connect(self.start_camera_stream)
+        stream_grid.addWidget(self.btn_start, 0, 0)
+        
+        self.btn_stop = QPushButton("Dừng Truyền Hình")
+        self.btn_stop.setObjectName("btn_stop")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_camera_stream)
+        stream_grid.addWidget(self.btn_stop, 0, 1)
+        
+        right_layout.addWidget(stream_group)
+        
+        # 2. Config parameters group
+        config_group = QGroupBox("CẤU HÌNH PHÁT HIỆN & THỐNG KÊ")
+        config_grid = QGridLayout(config_group)
+        
+        # Tag size in mm
+        config_grid.addWidget(QLabel("Kích thước AprilTag (mm):"), 0, 0)
+        self.sb_tag_size = QDoubleSpinBox()
+        self.sb_tag_size.setRange(1.0, 1000.0)
+        self.sb_tag_size.setValue(150.0) # default 150mm
+        self.sb_tag_size.setSuffix(" mm")
+        self.sb_tag_size.valueChanged.connect(self.push_config_to_worker)
+        config_grid.addWidget(self.sb_tag_size, 0, 1)
+        
+        # Source tag ID (ID 1)
+        config_grid.addWidget(QLabel("AprilTag ID Nguồn (Gốc):"), 1, 0)
+        self.sb_source_id = QSpinBox()
+        self.sb_source_id.setRange(0, 1000)
+        self.sb_source_id.setValue(1) # Default ID 1
+        self.sb_source_id.valueChanged.connect(self.push_config_to_worker)
+        config_grid.addWidget(self.sb_source_id, 1, 1)
+        
+        # Target tag IDs
+        config_grid.addWidget(QLabel("ID Đường Mục Tiêu (Ngăn cách bằng dấu phẩy):"), 2, 0)
+        self.txt_target_ids = QLineEdit()
+        self.txt_target_ids.setPlaceholderText("Trống: Dùng tất cả tag khác")
+        self.txt_target_ids.textChanged.connect(self.push_config_to_worker)
+        config_grid.addWidget(self.txt_target_ids, 2, 1)
+        
+        # Coordinate calculation mode
+        config_grid.addWidget(QLabel("Thuật toán tọa độ 3D:"), 3, 0)
+        self.cb_coord_mode = QComboBox()
+        self.cb_coord_mode.addItem("Sử dụng SolvePnP hình học (Khuyên dùng)", "pnp")
+        self.cb_coord_mode.addItem("Sử dụng Cảm biến Depth RealSense trực tiếp", "depth")
+        self.cb_coord_mode.currentIndexChanged.connect(self.push_config_to_worker)
+        config_grid.addWidget(self.cb_coord_mode, 3, 1)
+        
+        right_layout.addWidget(config_group)
+        
+        # 2.5 Tracking & Filtering configuration
+        tracking_group = QGroupBox("BÁM VẾT & BỘ LỌC MƯỢT 3D (TRACKING)")
+        tracking_grid = QGridLayout(tracking_group)
+        
+        self.chk_enable_smoothing = QCheckBox("Kích hoạt bộ lọc mượt 3D (EMA)")
+        self.chk_enable_smoothing.setChecked(True)
+        self.chk_enable_smoothing.stateChanged.connect(self.push_config_to_worker)
+        tracking_grid.addWidget(self.chk_enable_smoothing, 0, 0, 1, 2)
+        
+        tracking_grid.addWidget(QLabel("Độ phản hồi bộ lọc (Alpha):"), 1, 0)
+        self.sb_filter_alpha = QDoubleSpinBox()
+        self.sb_filter_alpha.setRange(0.01, 1.0)
+        self.sb_filter_alpha.setValue(0.30)
+        self.sb_filter_alpha.setSingleStep(0.05)
+        self.sb_filter_alpha.valueChanged.connect(self.push_config_to_worker)
+        tracking_grid.addWidget(self.sb_filter_alpha, 1, 1)
+        
+        self.chk_enable_keep_alive = QCheckBox("Duy trì trạng thái khi mất dấu tạm thời")
+        self.chk_enable_keep_alive.setChecked(True)
+        self.chk_enable_keep_alive.stateChanged.connect(self.push_config_to_worker)
+        tracking_grid.addWidget(self.chk_enable_keep_alive, 2, 0, 1, 2)
+        
+        tracking_grid.addWidget(QLabel("Khung hình duy trì tối đa (Max Lost):"), 3, 0)
+        self.sb_max_lost_frames = QSpinBox()
+        self.sb_max_lost_frames.setRange(1, 100)
+        self.sb_max_lost_frames.setValue(15)
+        self.sb_max_lost_frames.valueChanged.connect(self.push_config_to_worker)
+        tracking_grid.addWidget(self.sb_max_lost_frames, 3, 1)
+        
+        tracking_grid.addWidget(QLabel("Độ dài bộ lọc trung bình (khung hình):"), 4, 0)
+        self.sb_window_size = QSpinBox()
+        self.sb_window_size.setRange(1, 100)
+        self.sb_window_size.setValue(10) # default window size of 10 frames (~0.3s)
+        self.sb_window_size.valueChanged.connect(self.push_config_to_worker)
+        tracking_grid.addWidget(self.sb_window_size, 4, 1)
+        
+        right_layout.addWidget(tracking_group)
+        
+        # 3. Measurements cards (large display)
+        measure_group = QGroupBox("KẾT QUẢ ĐO KHOẢNG CÁCH")
+        measure_vbox = QVBoxLayout(measure_group)
+        
+        # Card: Polyline distance
+        card_poly = QFrameCard(self)
+        card_poly_layout = QVBoxLayout(card_poly)
+        card_poly_title = QLabel("KHOẢNG CÁCH AprilTag ID1 ĐẾN ĐƯỜNG MỤC TIÊU")
+        card_poly_title.setObjectName("card_title")
+        self.lbl_poly_val = QLabel("N/A")
+        self.lbl_poly_val.setObjectName("lbl_poly_val")
+        self.lbl_poly_val.setAlignment(Qt.AlignCenter)
+        card_poly_layout.addWidget(card_poly_title)
+        card_poly_layout.addWidget(self.lbl_poly_val)
+        
+        measure_vbox.addWidget(card_poly)
+        right_layout.addWidget(measure_group)
+        
+        # 4. Detected tags list table
+        table_group = QGroupBox("DANH SÁCH TAG ĐANG PHÁT HIỆN")
+        table_vbox = QVBoxLayout(table_group)
+        
+        self.table_tags = QTableWidget()
+        self.table_tags.setColumnCount(6)
+        self.table_tags.setHorizontalHeaderLabels(["ID", "Vai trò", "Trạng thái", "X (mm)", "Y (mm)", "Z (mm)"])
+        self.table_tags.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table_tags.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table_tags.setObjectName("table_tags")
+        table_vbox.addWidget(self.table_tags)
+        
+        right_layout.addWidget(table_group, 1) # table gets remaining vertical stretch
+        
+        # 5. Data logger panel
+        logger_group = QGroupBox("GHI NHẬT KÝ ĐO LƯỜNG (REAL-TIME LOGGER)")
+        logger_layout = QHBoxLayout(logger_group)
+        
+        self.chk_logging = QCheckBox("Bật ghi nhật ký trực tiếp")
+        self.chk_logging.setEnabled(False)
+        self.chk_logging.stateChanged.connect(self.toggle_logger)
+        logger_layout.addWidget(self.chk_logging)
+        
+        self.lbl_logger_status = QLabel("Chưa mở file nhật ký.")
+        self.lbl_logger_status.setObjectName("lbl_logger_status")
+        logger_layout.addWidget(self.lbl_logger_status, 1)
+        
+        self.btn_select_log = QPushButton("Chọn File Lưu...")
+        self.btn_select_log.setObjectName("btn_normal")
+        self.btn_select_log.clicked.connect(self.select_log_file)
+        logger_layout.addWidget(self.btn_select_log)
+        
+        right_layout.addWidget(logger_group)
+        
+        main_layout.addLayout(right_layout, 1)
+        
+    def apply_stylesheet(self):
+        qss = """
+        QMainWindow {
+            background-color: #1a1a1a;
+        }
+        
+        QWidget {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            color: #d1d1d1;
+            font-size: 13px;
+        }
+        
+        #title_label {
+            font-weight: bold;
+            font-size: 15px;
+            color: #00e5ff;
+            padding: 5px;
+            background-color: #232323;
+            border-radius: 4px;
+            border-left: 4px solid #00e5ff;
+        }
+        
+        QLabel#lbl_video {
+            background-color: #0d0d0d;
+            border: 2px solid #282828;
+            border-radius: 8px;
+            color: #757575;
+            font-weight: bold;
+            font-size: 15px;
+        }
+        
+        QLabel#lbl_status_bar {
+            color: #888888;
+            font-size: 11px;
+            padding: 4px;
+        }
+        
+        QGroupBox {
+            font-weight: bold;
+            border: 1px solid #2d2d2d;
+            border-radius: 8px;
+            margin-top: 15px;
+            padding-top: 15px;
+            background-color: #222222;
+        }
+        
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 10px;
+            padding: 0 6px;
+            color: #00e5ff;
+            font-size: 12px;
+            text-transform: uppercase;
+        }
+        
+        QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+            background-color: #2c2c2c;
+            border: 1px solid #3c3c3c;
+            border-radius: 4px;
+            padding: 5px;
+            color: #ffffff;
+        }
+        
+        QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {
+            border: 1px solid #00e5ff;
+        }
+        
+        QPushButton {
+            background-color: #2d2d2d;
+            border: 1px solid #444444;
+            border-radius: 4px;
+            padding: 8px 12px;
+            color: #ffffff;
+            font-weight: bold;
+        }
+        
+        QPushButton:hover {
+            background-color: #3d3d3d;
+            border-color: #555555;
+        }
+        
+        QPushButton#btn_start {
+            background-color: #00c853;
+            color: #ffffff;
+            border: none;
+        }
+        
+        QPushButton#btn_start:hover {
+            background-color: #00e676;
+        }
+        
+        QPushButton#btn_start:disabled {
+            background-color: #1b5e20;
+            color: #7f7f7f;
+        }
+        
+        QPushButton#btn_stop {
+            background-color: #d50000;
+            color: #ffffff;
+            border: none;
+        }
+        
+        QPushButton#btn_stop:hover {
+            background-color: #ff1744;
+        }
+        
+        QPushButton#btn_stop:disabled {
+            background-color: #b71c1c;
+            color: #7f7f7f;
+        }
+        
+        QPushButton#btn_normal {
+            background-color: #0091ea;
+            border: none;
+            color: white;
+        }
+        
+        QPushButton#btn_normal:hover {
+            background-color: #00b0ff;
+        }
+        
+        QTableWidget {
+            background-color: #1e1e1e;
+            alternate-background-color: #252525;
+            border: 1px solid #2d2d2d;
+            gridline-color: #2d2d2d;
+            border-radius: 6px;
+        }
+        
+        QHeaderView::section {
+            background-color: #2c2c2c;
+            color: #00e5ff;
+            padding: 5px;
+            border: none;
+            border-bottom: 1px solid #3d3d3d;
+            font-weight: bold;
+        }
+        
+        QTableWidget::item {
+            padding: 4px;
+        }
+        
+        QCheckBox {
+            spacing: 5px;
+        }
+        
+        QCheckBox::indicator {
+            width: 18px;
+            height: 18px;
+        }
+        """
+        self.setStyleSheet(qss)
+        
+    def push_config_to_worker(self):
+        tag_size = self.sb_tag_size.value() / 1000.0 # Convert mm to meters
+        source_id = self.sb_source_id.value()
+        target_ids = self.txt_target_ids.text()
+        coord_mode = self.cb_coord_mode.currentData()
+        
+        # Read tracking settings
+        filter_alpha = self.sb_filter_alpha.value()
+        max_lost_frames = self.sb_max_lost_frames.value()
+        enable_smoothing = self.chk_enable_smoothing.isChecked()
+        enable_keep_alive = self.chk_enable_keep_alive.isChecked()
+        window_size = self.sb_window_size.value()
+        
+        self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
+                                  filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size)
+        
+    def start_camera_stream(self):
+        self.push_config_to_worker()
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.sb_source_id.setEnabled(False)
+        
+        self.worker.start()
+        
+    def stop_camera_stream(self):
+        self.btn_stop.setEnabled(False)
+        self.chk_logging.setChecked(False) # Turn off logger if camera is stopped
+        self.worker.stop()
+        
+        # Reset UI display
+        self.video_label.clear()
+        self.video_label.setText("Truyền hình camera đã dừng. Nhấn 'Bắt Đầu Truyền Hình' để kết nối lại.")
+        self.lbl_poly_val.setText("N/A")
+        self.lbl_poly_val.setStyleSheet("")
+        self.table_tags.setRowCount(0)
+        
+        # Reset plot history
+        self.plot_start_time = None
+        self.plot_time_history.clear()
+        self.plot_poly_history.clear()
+        self.curve_poly.setData([], [])
+        
+        self.btn_start.setEnabled(True)
+        self.sb_source_id.setEnabled(True)
+        
+    def select_log_file(self):
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Chọn file lưu Nhật Ký CSV", desktop_path, "CSV Files (*.csv)"
+        )
+        if file_path:
+            self.lbl_logger_status.setText(f"Lưu tại: {os.path.basename(file_path)}")
+            self.lbl_logger_status.setToolTip(file_path)
+            self._saved_file_path = file_path
+            self.chk_logging.setEnabled(True)
+            
+    def toggle_logger(self, state):
+        if state == Qt.Checked.value or state is True:
+            if hasattr(self, '_saved_file_path') and self._saved_file_path:
+                try:
+                    self.worker.start_logging(self._saved_file_path)
+                    self.lbl_logger_status.setText("Đang ghi dữ liệu...")
+                    self.btn_select_log.setEnabled(False)
+                except Exception as e:
+                    QMessageBox.critical(self, "Lỗi Logger", f"Không thể tạo hoặc ghi file: {str(e)}")
+                    self.chk_logging.setChecked(False)
+            else:
+                QMessageBox.warning(self, "Chưa chọn file", "Vui lòng chọn file lưu nhật ký trước.")
+                self.chk_logging.setChecked(False)
+        else:
+            self.worker.stop_logging()
+            self.btn_select_log.setEnabled(True)
+            if hasattr(self, '_saved_file_path') and self._saved_file_path:
+                self.lbl_logger_status.setText(f"Tạm dừng. File: {os.path.basename(self._saved_file_path)}")
+            else:
+                self.lbl_logger_status.setText("Chưa chọn file lưu.")
+ 
+    @Slot(np.ndarray, dict)
+    def update_frame(self, frame_bgr, results):
+        # Convert BGR from OpenCV to RGB for QImage
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame_rgb.shape
+        bytes_per_line = ch * w
+        
+        q_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(q_image)
+        
+        # Scale pixmap to fit label while maintaining aspect ratio
+        scaled_pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.video_label.setPixmap(scaled_pixmap)
+        
+        # Update real-time plot
+        if self.plot_start_time is None:
+            self.plot_start_time = time.time()
+        elapsed = time.time() - self.plot_start_time
+        
+        poly_val = results['polyline_dist']
+        
+        self.plot_time_history.append(elapsed)
+        self.plot_poly_history.append(poly_val if poly_val is not None else float('nan'))
+        
+        if len(self.plot_time_history) > self.max_history_points:
+            self.plot_time_history.pop(0)
+            self.plot_poly_history.pop(0)
+            
+        self.curve_poly.setData(self.plot_time_history, self.plot_poly_history)
+        
+        # Update metrics cards
+        # Polyline distance display
+        if results['polyline_dist'] is not None:
+            self.lbl_poly_val.setText(f"{results['polyline_dist']:.1f} mm")
+            self.lbl_poly_val.setStyleSheet("color: #00e676; font-size: 28px; font-weight: bold;")
+        else:
+            self.lbl_poly_val.setText("N/A")
+            self.lbl_poly_val.setStyleSheet("color: #757575; font-size: 28px; font-weight: bold;")
+            
+        # Update detected tags table
+        detected = results['detected_tags']
+        self.table_tags.setRowCount(len(detected))
+        
+        for idx, (tid, data) in enumerate(sorted(detected.items())):
+            # Table columns: ID, Role, Status, X (mm), Y (mm), Z (mm)
+            # Select values depending on coordinate mode
+            selected_pos = data['pos_pnp'] if results['selected_mode'] == 'pnp' else data['pos_depth']
+            
+            item_id = QTableWidgetItem(str(tid))
+            item_role = QTableWidgetItem(data['role'])
+            item_status = QTableWidgetItem(data['status'])
+            item_x = QTableWidgetItem(f"{selected_pos[0]:.1f}")
+            item_y = QTableWidgetItem(f"{selected_pos[1]:.1f}")
+            item_z = QTableWidgetItem(f"{selected_pos[2]:.1f}")
+            
+            # Format text colors for status
+            if data['lost_frames'] == 0:
+                item_status.setForeground(QColor("#00e676")) # bright green
+            else:
+                item_status.setForeground(QColor("#ffaa00")) # orange/yellow
+            
+            # Format text colors for role
+            if "Nguồn" in data['role']:
+                item_role.setForeground(QColor("#ff1744"))
+            elif "Mục tiêu" in data['role'] or "Đường" in data['role']:
+                item_role.setForeground(QColor("#00e5ff"))
+                
+            self.table_tags.setItem(idx, 0, item_id)
+            self.table_tags.setItem(idx, 1, item_role)
+            self.table_tags.setItem(idx, 2, item_status)
+            self.table_tags.setItem(idx, 3, item_x)
+            self.table_tags.setItem(idx, 4, item_y)
+            self.table_tags.setItem(idx, 5, item_z)
+
+    @Slot(str)
+    def handle_camera_error(self, error_msg):
+        QMessageBox.critical(self, "Lỗi Camera RealSense", error_msg)
+        self.stop_camera_stream()
+        
+    @Slot(str)
+    def update_status(self, msg):
+        self.status_bar_lbl.setText(msg)
+        
+    def closeEvent(self, event):
+        # Shut down worker thread properly to unlock realsense camera
+        self.chk_logging.setChecked(False)
+        if self.worker.isRunning():
+            self.worker.stop()
+        event.accept()
+
+
+class QFrameCard(QWidget):
+    """Custom premium UI component representing a metric card with a dark background and border."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #242424;
+                border: 1px solid #353535;
+                border-radius: 8px;
+            }
+            #card_title {
+                color: #888888;
+                font-size: 11px;
+                font-weight: bold;
+                border: none;
+                background-color: transparent;
+            }
+        """)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = GroundTruthApp()
+    window.show()
+    sys.exit(app.exec())
