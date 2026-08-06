@@ -7,6 +7,11 @@ Dự án này cung cấp một giải pháp phần mềm hoàn chỉnh và trự
 ## 🌟 Tính Năng Nổi Bật
 
 *   **Phát hiện AprilTag 3D thời gian thực**: Sử dụng thư viện OpenCV Aruco hỗ trợ họ thẻ `DICT_APRILTAG_36h11`.
+*   **Các bộ lọc xử lý ảnh chiều sâu RealSense SDK (Post-Processing)**:
+    *   **Decimation Filter**: Giảm độ phân giải của hình ảnh độ sâu để giảm nhiễu hạt và tăng tốc độ xử lý.
+    *   **Spatial Filter**: Làm mịn ảnh chiều sâu trong không gian bằng thuật toán lọc giữ biên cạnh (edge-preserving).
+    *   **Temporal Filter**: Làm mịn ảnh chiều sâu theo thời gian, giảm hiện tượng nhấp nháy pixel chiều sâu giữa các frame.
+    *   **Hole Filling Filter**: Vá các lỗ trống (vùng thiếu dữ liệu depth do bị khuất hoặc phản xạ kém) bằng thuật toán nội suy thông minh.
 *   **Bám vết và lọc nhiễu nâng cao**:
     *   **Bộ lọc mượt EMA (Exponential Moving Average)**: Giảm thiểu hiện tượng rung sai số (jitter) trong tọa độ 3D và góc xoay.
     *   **Cơ chế Keep-Alive**: Duy trì bám vết và nội suy vị trí của thẻ tag ngay cả khi bị che khuất tạm thời (trong khoảng số lượng khung hình định trước).
@@ -76,6 +81,8 @@ python GroundTruth.py
     *   *Kích hoạt bộ lọc mượt 3D (EMA)* để giảm nhiễu giật hình ảnh.
     *   *Khung hình duy trì tối đa (Max Lost)*: Số lượng khung hình mà hệ thống vẫn duy trì vị trí cũ của tag sau khi tag bị che khuất trước khi đánh dấu là mất kết nối.
     *   *Độ dài bộ lọc trung bình (Window Size)*: Số lượng khung hình dùng để tính toán trung bình trượt cho khoảng cách đo được hiển thị trên đồ thị.
+7.  **Bộ lọc chiều sâu RealSense (Post-Processing)**:
+    *   Tích chọn các bộ lọc tương ứng để cải thiện chất lượng ảnh chiều sâu từ camera: `Decimation Filter`, `Hole Filling Filter`, `Spatial Filter`, `Temporal Filter`. Các bộ lọc này sẽ tự động được áp dụng trực tiếp theo thứ tự tối ưu của RealSense SDK.
 
 ### Bước 4: Vận hành và ghi nhật ký
 1.  Nhấn nút **Quét Thiết Bị (Scan)** trên giao diện chính để kiểm tra số lượng và thông tin chi tiết camera Intel RealSense đang kết nối.

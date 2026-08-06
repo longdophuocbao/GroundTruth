@@ -86,6 +86,12 @@ class CameraWorker(QThread):
         self._enable_smoothing = True
         self._enable_keep_alive = True
         
+        # RealSense SDK post-processing filters config
+        self._enable_decimation = False
+        self._enable_hole_filling = False
+        self._enable_spatial = False
+        self._enable_temporal = False
+        
         self._trackers = {}
         self._distance_history = []
         self._window_size = 10
@@ -99,7 +105,8 @@ class CameraWorker(QThread):
 
     # Thread-safe getters/setters
     def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
-                      filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size):
+                      filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
+                      enable_decimation, enable_hole_filling, enable_spatial, enable_temporal):
         with QMutexLocker(self._mutex):
             self._tag_size = tag_size
             self._source_id = source_id
@@ -110,6 +117,10 @@ class CameraWorker(QThread):
             self._enable_smoothing = enable_smoothing
             self._enable_keep_alive = enable_keep_alive
             self._window_size = window_size
+            self._enable_decimation = enable_decimation
+            self._enable_hole_filling = enable_hole_filling
+            self._enable_spatial = enable_spatial
+            self._enable_temporal = enable_temporal
 
     def start_logging(self, file_path):
         with QMutexLocker(self._mutex):
@@ -194,6 +205,12 @@ class CameraWorker(QThread):
             parameters = cv2.aruco.DetectorParameters()
             detector = cv2.aruco.ArucoDetector(dictionary, parameters)
             
+            # Initialize RealSense SDK post-processing filters
+            decimate_filter = rs.decimation_filter()
+            spatial_filter = rs.spatial_filter()
+            temporal_filter = rs.temporal_filter()
+            hole_filling_filter = rs.hole_filling_filter()
+            
             # Wait for sensors to warm up/auto-exposure to stabilize
             for _ in range(10):
                 if not self.running:
@@ -231,6 +248,20 @@ class CameraWorker(QThread):
                     max_lost_frames = self._max_lost_frames
                     enable_smoothing = self._enable_smoothing
                     enable_keep_alive = self._enable_keep_alive
+                    enable_decimation = self._enable_decimation
+                    enable_hole_filling = self._enable_hole_filling
+                    enable_spatial = self._enable_spatial
+                    enable_temporal = self._enable_temporal
+                
+                # Apply RealSense SDK post-processing filters to depth_frame
+                if enable_decimation:
+                    depth_frame = decimate_filter.process(depth_frame)
+                if enable_spatial:
+                    depth_frame = spatial_filter.process(depth_frame)
+                if enable_temporal:
+                    depth_frame = temporal_filter.process(depth_frame)
+                if enable_hole_filling:
+                    depth_frame = hole_filling_filter.process(depth_frame)
                 
                 # Grayscale for AprilTag detection
                 gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
@@ -268,12 +299,18 @@ class CameraWorker(QThread):
                         
                         # Retrieve 3D point via Depth sensor
                         depth_val = 0.0
-                        h, w = depth_frame.get_height(), depth_frame.get_width()
+                        depth_w = depth_frame.get_width()
+                        depth_h = depth_frame.get_height()
+                        color_h, color_w = color_image.shape[:2]
+                        
+                        u_c_depth = int(u_c * depth_w / color_w)
+                        v_c_depth = int(v_c * depth_h / color_h)
+                        
                         depths = []
                         for dy in range(-2, 3):
                             for dx in range(-2, 3):
-                                nu, nv = int(u_c) + dx, int(v_c) + dy
-                                if 0 <= nu < w and 0 <= nv < h:
+                                nu, nv = u_c_depth + dx, v_c_depth + dy
+                                if 0 <= nu < depth_w and 0 <= nv < depth_h:
                                     d = depth_frame.get_distance(nu, nv)
                                     if d > 0.0:
                                         depths.append(d)
@@ -660,6 +697,28 @@ class SettingsDialog(QDialog):
         
         layout.addWidget(tracking_group)
         
+        # 2.5 RealSense SDK Post-Processing filters
+        realsense_group = QGroupBox("BỘ LỌC CHIỀU SÂU REALSENSE (POST-PROCESSING)")
+        realsense_grid = QGridLayout(realsense_group)
+        
+        self.chk_decimation = QCheckBox("Decimation Filter (Giảm độ phân giải)")
+        self.chk_decimation.setChecked(False)
+        realsense_grid.addWidget(self.chk_decimation, 0, 0)
+        
+        self.chk_hole_filling = QCheckBox("Hole Filling Filter (Vá lỗ thủng)")
+        self.chk_hole_filling.setChecked(False)
+        realsense_grid.addWidget(self.chk_hole_filling, 0, 1)
+        
+        self.chk_spatial = QCheckBox("Spatial Filter (Làm mịn không gian)")
+        self.chk_spatial.setChecked(False)
+        realsense_grid.addWidget(self.chk_spatial, 1, 0)
+        
+        self.chk_temporal = QCheckBox("Temporal Filter (Làm mịn theo thời gian)")
+        self.chk_temporal.setChecked(False)
+        realsense_grid.addWidget(self.chk_temporal, 1, 1)
+        
+        layout.addWidget(realsense_group)
+        
         # 3. Dialog buttons
         buttons_layout = QHBoxLayout()
         self.btn_ok = QPushButton("Đóng")
@@ -730,6 +789,10 @@ class SettingsDialog(QDialog):
             self.chk_enable_keep_alive.stateChanged.connect(parent.push_config_to_worker)
             self.sb_max_lost_frames.valueChanged.connect(parent.push_config_to_worker)
             self.sb_window_size.valueChanged.connect(parent.push_config_to_worker)
+            self.chk_decimation.stateChanged.connect(parent.push_config_to_worker)
+            self.chk_hole_filling.stateChanged.connect(parent.push_config_to_worker)
+            self.chk_spatial.stateChanged.connect(parent.push_config_to_worker)
+            self.chk_temporal.stateChanged.connect(parent.push_config_to_worker)
 
 
 class GroundTruthApp(QMainWindow):
@@ -1058,8 +1121,15 @@ class GroundTruthApp(QMainWindow):
         enable_keep_alive = self.settings_dialog.chk_enable_keep_alive.isChecked()
         window_size = self.settings_dialog.sb_window_size.value()
         
+        # Read RealSense SDK filters
+        enable_decimation = self.settings_dialog.chk_decimation.isChecked()
+        enable_hole_filling = self.settings_dialog.chk_hole_filling.isChecked()
+        enable_spatial = self.settings_dialog.chk_spatial.isChecked()
+        enable_temporal = self.settings_dialog.chk_temporal.isChecked()
+        
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
-                                  filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size)
+                                  filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
+                                  enable_decimation, enable_hole_filling, enable_spatial, enable_temporal)
         
     def scan_devices(self):
         self.status_bar_lbl.setText("Đang quét thiết bị camera...")
