@@ -27,9 +27,6 @@ Dự án này cung cấp một giải pháp phần mềm hoàn chỉnh và trự
 ```text
 ground truth/
 ├── GroundTruth.py            # Mã nguồn chính của ứng dụng GUI PySide6
-├── april_36h11-0.svg         # File vector AprilTag 36h11 ID 0 (để in ấn)
-├── april_36h11-1.svg         # File vector AprilTag 36h11 ID 1 (để in ấn)
-├── april_36h11-3.svg         # File vector AprilTag 36h11 ID 3 (để in ấn)
 └── README.md                 # Tài liệu hướng dẫn sử dụng (File này)
 ```
 
