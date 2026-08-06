@@ -19,6 +19,7 @@ Dự án này cung cấp một giải pháp phần mềm hoàn chỉnh và trự
     1.  **Cảm biến Depth RealSense (Mặc định)**: Lấy trực tiếp dữ liệu khoảng cách chiều sâu tại vùng tâm thẻ tag và chiếu ngược (deproject) sang hệ tọa độ 3D.
     2.  **SolvePnP hình học**: Sử dụng thông số nội tại (Camera Intrinsics) của camera màu RealSense kết hợp kích thước thực tế của tag để giải bài toán Pose Estimation.
 *   **Đo khoảng cách đến đường gấp khúc (Polyline)**: Tính toán khoảng cách vuông góc ngắn nhất từ vị trí thẻ Nguồn (Source) đến đường dẫn tạo bởi chuỗi thẻ Mục tiêu (Targets) trong không gian 3D.
+*   **Hiển thị luồng Depth chiều sâu song song (Tùy chọn)**: Hỗ trợ hiển thị đồng thời cả camera màu RGB (đã vẽ đè tọa độ/đo đạc) và camera chiều sâu (được tô màu colorized bằng SDK RealSense) để giám sát trực quan hơn, có thể bật/tắt linh hoạt.
 *   **Giao diện đồ họa (GUI) trực quan & hiện đại**: 
     *   Xây dựng bằng **PySide6 (Qt for Python)** với giao diện tối (Dark Mode) cao cấp.
     *   Vẽ đồ thị khoảng cách thời gian thực (Real-time Plot) mượt mà bằng **pyqtgraph**.
@@ -86,11 +87,12 @@ python GroundTruth.py
 
 ### Bước 4: Vận hành và ghi nhật ký
 1.  Nhấn nút **Quét Thiết Bị (Scan)** trên giao diện chính để kiểm tra số lượng và thông tin chi tiết camera Intel RealSense đang kết nối.
-2.  Nhấn nút **Bắt Đầu Truyền Hình** để bắt đầu nhận luồng video từ camera RealSense.
-3.  **Ghi nhật ký CSV (Tùy chọn)**:
+2.  Tích chọn **Hiển thị camera Depth chiều sâu** nếu bạn muốn hiển thị đồng thời cả luồng hình ảnh màu RGB và ảnh chiều sâu (được tô màu). Bỏ tích để ẩn luồng depth.
+3.  Nhấn nút **Bắt Đầu Truyền Hình** để bắt đầu nhận luồng video từ camera RealSense.
+4.  **Ghi nhật ký CSV (Tùy chọn)**:
     *   Nhấn **Chọn File Lưu...** để tạo đường dẫn và tên tệp CSV (mặc định lưu ra màn hình Desktop).
     *   Tích chọn **Bật ghi nhật ký trực tiếp** để bắt đầu lưu dữ liệu. Có thể nhấn bỏ tích để tạm dừng ghi.
-4.  Nhấn **Dừng Truyền Hình** khi kết thúc quá trình đo đạc.
+5.  Nhấn **Dừng Truyền Hình** khi kết thúc quá trình đo đạc.
 
 ---
 

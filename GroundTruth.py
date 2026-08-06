@@ -210,6 +210,7 @@ class CameraWorker(QThread):
             spatial_filter = rs.spatial_filter()
             temporal_filter = rs.temporal_filter()
             hole_filling_filter = rs.hole_filling_filter()
+            colorizer = rs.colorizer()
             
             # Wait for sensors to warm up/auto-exposure to stabilize
             for _ in range(10):
@@ -496,6 +497,11 @@ class CameraWorker(QThread):
                 # Log data if active
                 if is_logging:
                     self._write_log_row(results, source_id, source_pos, target_ids)
+                
+                # Generate colorized depth image to send to GUI
+                colorized_depth = colorizer.colorize(depth_frame)
+                depth_image = np.asanyarray(colorized_depth.get_data())
+                results['depth_image'] = depth_image
                 
                 # Send frame and results to GUI
                 self.frame_ready.emit(color_image, results)
@@ -845,13 +851,30 @@ class GroundTruthApp(QMainWindow):
         title_label.setObjectName("title_label")
         left_layout.addWidget(title_label)
         
-        # Label to display video frames
+        # Camera monitor container for dual streams
+        self.camera_container = QWidget()
+        self.camera_layout = QHBoxLayout(self.camera_container)
+        self.camera_layout.setContentsMargins(0, 0, 0, 0)
+        self.camera_layout.setSpacing(10)
+        
+        # Label to display color video frames
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setText("Vui lòng nhấn 'Bắt Đầu Truyền Hình' để kết nối camera.")
         self.video_label.setObjectName("lbl_video")
-        self.video_label.setMinimumSize(640, 400)
-        left_layout.addWidget(self.video_label, 3) # Stretch factor 3
+        self.video_label.setMinimumSize(480, 360)
+        self.camera_layout.addWidget(self.video_label)
+        
+        # Label to display depth video frames
+        self.depth_label = QLabel()
+        self.depth_label.setAlignment(Qt.AlignCenter)
+        self.depth_label.setText("Luồng Depth đang ẩn.")
+        self.depth_label.setObjectName("lbl_video")
+        self.depth_label.setMinimumSize(480, 360)
+        self.depth_label.setVisible(False) # Default hidden
+        self.camera_layout.addWidget(self.depth_label)
+        
+        left_layout.addWidget(self.camera_container, 3) # Stretch factor 3
         
         # Real-time Plot Widget using pyqtgraph
         self.plot_widget = pg.PlotWidget()
@@ -894,6 +917,12 @@ class GroundTruthApp(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_camera_stream)
         stream_grid.addWidget(self.btn_stop, 1, 1)
+        
+        # Checkbox to toggle depth view
+        self.chk_show_depth = QCheckBox("Hiển thị camera Depth chiều sâu")
+        self.chk_show_depth.setChecked(False)
+        self.chk_show_depth.stateChanged.connect(self.toggle_depth_visibility)
+        stream_grid.addWidget(self.chk_show_depth, 2, 0, 1, 2)
         
         right_layout.addWidget(stream_group)
         
@@ -1201,6 +1230,14 @@ class GroundTruthApp(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.settings_dialog.sb_source_id.setEnabled(True)
         
+    def toggle_depth_visibility(self, state):
+        if state == Qt.Checked.value or state is True:
+            self.depth_label.setVisible(True)
+        else:
+            self.depth_label.setVisible(False)
+            self.depth_label.clear()
+            self.depth_label.setText("Luồng Depth đang ẩn.")
+        
     def select_log_file(self):
         desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1246,6 +1283,18 @@ class GroundTruthApp(QMainWindow):
         # Scale pixmap to fit label while maintaining aspect ratio
         scaled_pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.video_label.setPixmap(scaled_pixmap)
+        
+        # Display depth image if the checkbox is checked and depth data is available
+        if self.chk_show_depth.isChecked() and 'depth_image' in results:
+            depth_bgr = results['depth_image']
+            depth_rgb = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2RGB)
+            dh, dw, dch = depth_rgb.shape
+            d_bytes_per_line = dch * dw
+            
+            dq_image = QImage(depth_rgb.data, dw, dh, d_bytes_per_line, QImage.Format_RGB888).copy()
+            dpixmap = QPixmap.fromImage(dq_image)
+            dscaled_pixmap = dpixmap.scaled(self.depth_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.depth_label.setPixmap(dscaled_pixmap)
         
         # Update real-time plot
         if self.plot_start_time is None:
