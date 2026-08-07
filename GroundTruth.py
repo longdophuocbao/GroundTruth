@@ -247,7 +247,7 @@ class CameraWorker(QThread):
                     continue
                     
                 # Convert frames to numpy arrays
-                color_image = np.asanyarray(color_frame.get_data())
+                color_image = np.asanyarray(color_frame.get_data()).copy()
                 
                 # Read latest config variables in a thread-safe way
                 with QMutexLocker(self._mutex):
@@ -524,7 +524,7 @@ class CameraWorker(QThread):
                 
                 # Generate colorized depth image to send to GUI
                 colorized_depth = colorizer.colorize(depth_frame)
-                depth_image = np.asanyarray(colorized_depth.get_data())
+                depth_image = np.asanyarray(colorized_depth.get_data()).copy()
                 results['depth_image'] = depth_image
                 
                 # Send frame and results to GUI
