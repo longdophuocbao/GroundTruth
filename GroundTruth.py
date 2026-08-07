@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, 
                              QGroupBox, QComboBox, QFileDialog, QMessageBox, QCheckBox,
                              QDoubleSpinBox, QSpinBox, QDialog)
-from PySide6.QtGui import QImage, QPixmap, QFont, QColor
+from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QIcon
 
 class TagTracker:
     def __init__(self, tag_id, alpha=0.7, max_lost_frames=15):
@@ -91,6 +91,9 @@ class CameraWorker(QThread):
         self._enable_hole_filling = False
         self._enable_spatial = False
         self._enable_temporal = False
+        self._enable_threshold = False
+        self._threshold_min = 0.15
+        self._threshold_max = 4.0
         
         self._trackers = {}
         self._distance_history = []
@@ -106,7 +109,8 @@ class CameraWorker(QThread):
     # Thread-safe getters/setters
     def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
                       filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
-                      enable_decimation, enable_hole_filling, enable_spatial, enable_temporal):
+                      enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
+                      threshold_min, threshold_max):
         with QMutexLocker(self._mutex):
             self._tag_size = tag_size
             self._source_id = source_id
@@ -121,6 +125,12 @@ class CameraWorker(QThread):
             self._enable_hole_filling = enable_hole_filling
             self._enable_spatial = enable_spatial
             self._enable_temporal = enable_temporal
+            self._enable_threshold = enable_threshold
+            self._threshold_min = threshold_min
+            self._threshold_max = threshold_max
+
+    def stop(self):
+        self.running = False
 
     def start_logging(self, file_path):
         with QMutexLocker(self._mutex):
@@ -210,6 +220,7 @@ class CameraWorker(QThread):
             spatial_filter = rs.spatial_filter()
             temporal_filter = rs.temporal_filter()
             hole_filling_filter = rs.hole_filling_filter()
+            threshold_filter = rs.threshold_filter()
             colorizer = rs.colorizer()
             
             # Wait for sensors to warm up/auto-exposure to stabilize
@@ -253,8 +264,15 @@ class CameraWorker(QThread):
                     enable_hole_filling = self._enable_hole_filling
                     enable_spatial = self._enable_spatial
                     enable_temporal = self._enable_temporal
+                    enable_threshold = self._enable_threshold
+                    threshold_min = self._threshold_min
+                    threshold_max = self._threshold_max
                 
                 # Apply RealSense SDK post-processing filters to depth_frame
+                if enable_threshold:
+                    threshold_filter.set_option(rs.option.min_distance, threshold_min)
+                    threshold_filter.set_option(rs.option.max_distance, threshold_max)
+                    depth_frame = threshold_filter.process(depth_frame)
                 if enable_decimation:
                     depth_frame = decimate_filter.process(depth_frame)
                 if enable_spatial:
@@ -263,6 +281,12 @@ class CameraWorker(QThread):
                     depth_frame = temporal_filter.process(depth_frame)
                 if enable_hole_filling:
                     depth_frame = hole_filling_filter.process(depth_frame)
+                
+                # Cast the processed frame back to a depth_frame to expose get_width(), get_height(), get_distance()
+                if depth_frame:
+                    depth_frame = depth_frame.as_depth_frame()
+                if not depth_frame:
+                    continue
                 
                 # Grayscale for AprilTag detection
                 gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
@@ -723,6 +747,24 @@ class SettingsDialog(QDialog):
         self.chk_temporal.setChecked(False)
         realsense_grid.addWidget(self.chk_temporal, 1, 1)
         
+        self.chk_threshold = QCheckBox("Threshold Filter (Bộ lọc ngưỡng)")
+        self.chk_threshold.setChecked(False)
+        realsense_grid.addWidget(self.chk_threshold, 2, 0, 1, 2)
+        
+        realsense_grid.addWidget(QLabel("Ngưỡng Min (mét):"), 3, 0)
+        self.sb_threshold_min = QDoubleSpinBox()
+        self.sb_threshold_min.setRange(0.1, 10.0)
+        self.sb_threshold_min.setValue(0.15)
+        self.sb_threshold_min.setSingleStep(0.05)
+        realsense_grid.addWidget(self.sb_threshold_min, 3, 1)
+        
+        realsense_grid.addWidget(QLabel("Ngưỡng Max (mét):"), 4, 0)
+        self.sb_threshold_max = QDoubleSpinBox()
+        self.sb_threshold_max.setRange(0.1, 10.0)
+        self.sb_threshold_max.setValue(4.0)
+        self.sb_threshold_max.setSingleStep(0.1)
+        realsense_grid.addWidget(self.sb_threshold_max, 4, 1)
+        
         layout.addWidget(realsense_group)
         
         # 3. Dialog buttons
@@ -799,6 +841,9 @@ class SettingsDialog(QDialog):
             self.chk_hole_filling.stateChanged.connect(parent.push_config_to_worker)
             self.chk_spatial.stateChanged.connect(parent.push_config_to_worker)
             self.chk_temporal.stateChanged.connect(parent.push_config_to_worker)
+            self.chk_threshold.stateChanged.connect(parent.push_config_to_worker)
+            self.sb_threshold_min.valueChanged.connect(parent.push_config_to_worker)
+            self.sb_threshold_max.valueChanged.connect(parent.push_config_to_worker)
 
 
 class GroundTruthApp(QMainWindow):
@@ -806,6 +851,13 @@ class GroundTruthApp(QMainWindow):
         super().__init__()
         
         self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - Intel RealSense D455")
+        
+        # Set Window Icon
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(script_dir, "diving.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            
         self.setMinimumSize(1200, 850) # Increased height to accommodate the plot comfortably
         
         # Initialize settings dialog
@@ -860,7 +912,7 @@ class GroundTruthApp(QMainWindow):
         # Label to display color video frames
         self.video_label = QLabel()
         self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setText("Vui lòng nhấn 'Bắt Đầu Truyền Hình' để kết nối camera.")
+        self.video_label.setText("Vui lòng nhấn 'Run' để kết nối camera.")
         self.video_label.setObjectName("lbl_video")
         self.video_label.setMinimumSize(480, 360)
         self.camera_layout.addWidget(self.video_label)
@@ -907,16 +959,10 @@ class GroundTruthApp(QMainWindow):
         self.btn_scan.clicked.connect(self.scan_devices)
         stream_grid.addWidget(self.btn_scan, 0, 0, 1, 2)
         
-        self.btn_start = QPushButton("Bắt Đầu Truyền Hình")
-        self.btn_start.setObjectName("btn_start")
-        self.btn_start.clicked.connect(self.start_camera_stream)
-        stream_grid.addWidget(self.btn_start, 1, 0)
-        
-        self.btn_stop = QPushButton("Dừng Truyền Hình")
-        self.btn_stop.setObjectName("btn_stop")
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.clicked.connect(self.stop_camera_stream)
-        stream_grid.addWidget(self.btn_stop, 1, 1)
+        self.btn_toggle_stream = QPushButton("Run")
+        self.btn_toggle_stream.setObjectName("btn_start")
+        self.btn_toggle_stream.clicked.connect(self.toggle_camera_stream)
+        stream_grid.addWidget(self.btn_toggle_stream, 1, 0, 1, 2)
         
         # Checkbox to toggle depth view
         self.chk_show_depth = QCheckBox("Hiển thị camera Depth chiều sâu")
@@ -1155,10 +1201,14 @@ class GroundTruthApp(QMainWindow):
         enable_hole_filling = self.settings_dialog.chk_hole_filling.isChecked()
         enable_spatial = self.settings_dialog.chk_spatial.isChecked()
         enable_temporal = self.settings_dialog.chk_temporal.isChecked()
+        enable_threshold = self.settings_dialog.chk_threshold.isChecked()
+        threshold_min = self.settings_dialog.sb_threshold_min.value()
+        threshold_max = self.settings_dialog.sb_threshold_max.value()
         
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
-                                  enable_decimation, enable_hole_filling, enable_spatial, enable_temporal)
+                                  enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
+                                  threshold_min, threshold_max)
         
     def scan_devices(self):
         self.status_bar_lbl.setText("Đang quét thiết bị camera...")
@@ -1186,6 +1236,12 @@ class GroundTruthApp(QMainWindow):
             self.status_bar_lbl.setText("Lỗi khi quét thiết bị.")
             QMessageBox.critical(self, "Lỗi Quét Thiết Bị", f"Lỗi xảy ra trong quá trình quét: {str(e)}")
 
+    def toggle_camera_stream(self):
+        if self.worker.isRunning():
+            self.stop_camera_stream()
+        else:
+            self.start_camera_stream()
+
     def start_camera_stream(self):
         # Kiểm tra thiết bị RealSense trước để tránh treo app
         try:
@@ -1201,21 +1257,22 @@ class GroundTruthApp(QMainWindow):
             return
 
         self.push_config_to_worker()
-        self.btn_start.setEnabled(False)
-        self.btn_stop.setEnabled(True)
+        self.btn_toggle_stream.setText("Stop")
+        self.btn_toggle_stream.setObjectName("btn_stop")
+        self.btn_toggle_stream.style().unpolish(self.btn_toggle_stream)
+        self.btn_toggle_stream.style().polish(self.btn_toggle_stream)
         self.btn_scan.setEnabled(False)
         self.settings_dialog.sb_source_id.setEnabled(False)
         
         self.worker.start()
         
     def stop_camera_stream(self):
-        self.btn_stop.setEnabled(False)
         self.chk_logging.setChecked(False) # Turn off logger if camera is stopped
         self.worker.stop()
         
         # Reset UI display
         self.video_label.clear()
-        self.video_label.setText("Truyền hình camera đã dừng. Nhấn 'Bắt Đầu Truyền Hình' để kết nối lại.")
+        self.video_label.setText("Truyền hình camera đã dừng. Nhấn 'Run' để kết nối lại.")
         self.lbl_poly_val.setText("N/A")
         self.lbl_poly_val.setStyleSheet("")
         self.table_tags.setRowCount(0)
@@ -1226,7 +1283,10 @@ class GroundTruthApp(QMainWindow):
         self.plot_poly_history.clear()
         self.curve_poly.setData([], [])
         
-        self.btn_start.setEnabled(True)
+        self.btn_toggle_stream.setText("Run")
+        self.btn_toggle_stream.setObjectName("btn_start")
+        self.btn_toggle_stream.style().unpolish(self.btn_toggle_stream)
+        self.btn_toggle_stream.style().polish(self.btn_toggle_stream)
         self.btn_scan.setEnabled(True)
         self.settings_dialog.sb_source_id.setEnabled(True)
         

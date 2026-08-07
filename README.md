@@ -8,6 +8,7 @@ Dự án này cung cấp một giải pháp phần mềm hoàn chỉnh và trự
 
 *   **Phát hiện AprilTag 3D thời gian thực**: Sử dụng thư viện OpenCV Aruco hỗ trợ họ thẻ `DICT_APRILTAG_36h11`.
 *   **Các bộ lọc xử lý ảnh chiều sâu RealSense SDK (Post-Processing)**:
+    *   **Threshold Filter**: Lọc bỏ các điểm ảnh nằm ngoài giới hạn khoảng cách Min và Max mong muốn để loại bỏ nhiễu nền hoặc các vật thể ở quá xa/quá gần.
     *   **Decimation Filter**: Giảm độ phân giải của hình ảnh độ sâu để giảm nhiễu hạt và tăng tốc độ xử lý.
     *   **Spatial Filter**: Làm mịn ảnh chiều sâu trong không gian bằng thuật toán lọc giữ biên cạnh (edge-preserving).
     *   **Temporal Filter**: Làm mịn ảnh chiều sâu theo thời gian, giảm hiện tượng nhấp nháy pixel chiều sâu giữa các frame.
@@ -83,16 +84,16 @@ python GroundTruth.py
     *   *Khung hình duy trì tối đa (Max Lost)*: Số lượng khung hình mà hệ thống vẫn duy trì vị trí cũ của tag sau khi tag bị che khuất trước khi đánh dấu là mất kết nối.
     *   *Độ dài bộ lọc trung bình (Window Size)*: Số lượng khung hình dùng để tính toán trung bình trượt cho khoảng cách đo được hiển thị trên đồ thị.
 7.  **Bộ lọc chiều sâu RealSense (Post-Processing)**:
-    *   Tích chọn các bộ lọc tương ứng để cải thiện chất lượng ảnh chiều sâu từ camera: `Decimation Filter`, `Hole Filling Filter`, `Spatial Filter`, `Temporal Filter`. Các bộ lọc này sẽ tự động được áp dụng trực tiếp theo thứ tự tối ưu của RealSense SDK.
+    *   Tích chọn các bộ lọc tương ứng để cải thiện chất lượng ảnh chiều sâu từ camera: `Threshold Filter` (kèm theo nhập ngưỡng khoảng cách **Min** và **Max** mong muốn tính bằng mét), `Decimation Filter`, `Hole Filling Filter`, `Spatial Filter`, `Temporal Filter`. Các bộ lọc này sẽ tự động được áp dụng trực tiếp theo thứ tự tối ưu của RealSense SDK.
 
 ### Bước 4: Vận hành và ghi nhật ký
 1.  Nhấn nút **Quét Thiết Bị (Scan)** trên giao diện chính để kiểm tra số lượng và thông tin chi tiết camera Intel RealSense đang kết nối.
 2.  Tích chọn **Hiển thị camera Depth chiều sâu** nếu bạn muốn hiển thị đồng thời cả luồng hình ảnh màu RGB và ảnh chiều sâu (được tô màu). Bỏ tích để ẩn luồng depth.
-3.  Nhấn nút **Bắt Đầu Truyền Hình** để bắt đầu nhận luồng video từ camera RealSense.
+3.  Nhấn nút **Run** (màu xanh lá) để bắt đầu nhận luồng video từ camera RealSense. Nút sẽ tự động chuyển thành nút **Stop** (màu đỏ).
 4.  **Ghi nhật ký CSV (Tùy chọn)**:
     *   Nhấn **Chọn File Lưu...** để tạo đường dẫn và tên tệp CSV (mặc định lưu ra màn hình Desktop).
     *   Tích chọn **Bật ghi nhật ký trực tiếp** để bắt đầu lưu dữ liệu. Có thể nhấn bỏ tích để tạm dừng ghi.
-5.  Nhấn **Dừng Truyền Hình** khi kết thúc quá trình đo đạc.
+5.  Nhấn nút **Stop** (màu đỏ) khi kết thúc quá trình đo đạc để dừng luồng truyền hình và giải phóng thiết bị camera.
 
 ---
 
@@ -107,12 +108,19 @@ pip install nuitka
 ```
 
 ### 2. Lệnh biên dịch ứng dụng
-Chạy lệnh sau trong thư mục chứa dự án để biên dịch sang tệp `.exe` duy nhất (đã tối ưu hóa cho PySide6, OpenCV, RealSense, và tự động ẩn cửa sổ Console màu đen khi khởi chạy):
+Chạy một trong các lệnh sau trong thư mục chứa dự án để biên dịch sang tệp `.exe` duy nhất (đã tích hợp biểu tượng chuyên nghiệp `diving.ico`, tối ưu hóa cho PySide6, OpenCV, RealSense, và tự động ẩn cửa sổ Console màu đen khi khởi chạy):
+
+#### Biên dịch bằng Nuitka (Khuyên dùng - tốc độ nhanh nhất, kích thước tối ưu):
 ```bash
-python -m nuitka --standalone --onefile --enable-plugin=pyside6 --enable-plugin=numpy --windows-console-mode=disable --include-package=pyrealsense2 --assume-yes-for-downloads GroundTruth.py
+python -m nuitka --standalone --onefile --enable-plugin=pyside6 --enable-plugin=numpy --windows-console-mode=disable --include-package=pyrealsense2 --windows-icon-from-ico=diving.ico --assume-yes-for-downloads GroundTruth.py
 ```
 
-Sau khi quá trình biên dịch hoàn thành, tệp thực thi `GroundTruth.exe` sẽ được tạo ra tại thư mục dự án của bạn.
+#### Biên dịch bằng PyInstaller (Phương án thay thế):
+```bash
+pyinstaller --onefile --windowed --icon=diving.ico GroundTruth.py
+```
+
+Sau khi quá trình biên dịch hoàn thành, tệp thực thi `GroundTruth.exe` sẽ được tạo ra sẵn sàng sử dụng.
 
 ---
 
