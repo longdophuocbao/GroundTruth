@@ -827,7 +827,7 @@ class SettingsDialog(QDialog):
         tracking_grid.addWidget(QLabel("Độ dài bộ lọc trung bình (khung hình):"), 4, 0)
         self.sb_window_size = QSpinBox()
         self.sb_window_size.setRange(1, 1000)
-        self.sb_window_size.setValue(100) # default window size of 100 frames
+        self.sb_window_size.setValue(10) # default window size of 10 frames (highly responsive)
         tracking_grid.addWidget(self.sb_window_size, 4, 1)
         
         layout.addWidget(tracking_group)
