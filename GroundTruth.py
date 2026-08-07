@@ -1364,28 +1364,25 @@ class GroundTruthApp(QMainWindow):
             self.fps_counter = 0
             self.fps_timer = now
             
-        # Convert BGR from OpenCV to RGB for QImage
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        h, w, ch = frame_rgb.shape
+        # Directly wrap BGR frame in QImage without conversion and copy
+        h, w, ch = frame_bgr.shape
         bytes_per_line = ch * w
-        
-        q_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
+        q_image = QImage(frame_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
         pixmap = QPixmap.fromImage(q_image)
         
-        # Scale pixmap to fit label while maintaining aspect ratio
-        scaled_pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Scale pixmap using FastTransformation for maximum rendering speed
+        scaled_pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
         self.video_label.setPixmap(scaled_pixmap)
         
         # Display depth image if the checkbox is checked and depth data is available
         if self.chk_show_depth.isChecked() and 'depth_image' in results:
             depth_bgr = results['depth_image']
-            depth_rgb = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2RGB)
-            dh, dw, dch = depth_rgb.shape
+            dh, dw, dch = depth_bgr.shape
             d_bytes_per_line = dch * dw
             
-            dq_image = QImage(depth_rgb.data, dw, dh, d_bytes_per_line, QImage.Format_RGB888).copy()
+            dq_image = QImage(depth_bgr.data, dw, dh, d_bytes_per_line, QImage.Format_BGR888)
             dpixmap = QPixmap.fromImage(dq_image)
-            dscaled_pixmap = dpixmap.scaled(self.depth_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            dscaled_pixmap = dpixmap.scaled(self.depth_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
             self.depth_label.setPixmap(dscaled_pixmap)
         
         # Update real-time plot
