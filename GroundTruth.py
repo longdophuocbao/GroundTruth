@@ -453,10 +453,12 @@ class CameraWorker(QThread):
 
                 # Extract 3D points of targets
                 target_pts = []
+                target_map = {}
                 for tid in target_ids:
                     tag = active_tags[tid]
                     pos = tag['pos_pnp'] if coord_mode == 'pnp' else tag['pos_depth']
                     target_pts.append(pos)
+                    target_map[tid] = pos
                 
                 results['num_targets'] = len(target_pts)
                 
@@ -491,27 +493,10 @@ class CameraWorker(QThread):
                         cv2.drawFrameAxes(color_image, cam_matrix, dist_coeffs, 
                                           tag['rvec'], tag['tvec'], length=tag_size * 0.5, thickness=2)
                 
-                # Compute distance to polyline if source and targets are detected
+                # Compute distance to plane of targets if source and targets are detected
                 if source_pos is not None and len(target_pts) > 0:
-                    src_tag = active_tags[source_id]
-                    # Project target points onto the local XY plane of the source tag (ID1) if rvec is available
-                    if src_tag.get('rvec') is not None:
-                        R_src, _ = cv2.Rodrigues(src_tag['rvec'])
-                        target_pts_proj = []
-                        for q in target_pts:
-                            # Transform to local coordinate system of ID1
-                            q_local = R_src.T @ (q - source_pos)
-                            # Project onto the local XY plane by setting the local Z component to 0
-                            q_proj_local = np.array([q_local[0], q_local[1], 0.0])
-                            # Transform back to camera coordinates
-                            q_proj_cam = R_src @ q_proj_local + source_pos
-                            target_pts_proj.append(q_proj_cam)
-                        target_pts_to_use = target_pts_proj
-                    else:
-                        target_pts_to_use = target_pts
-
-                    # Polyline distance
-                    poly_dist, poly_closest_3d = self._distance_point_to_polyline(source_pos, target_pts_to_use)
+                    # Perpendicular distance to the fitted plane of target tags
+                    poly_dist, poly_closest_3d = self._distance_point_to_fitted_plane(source_pos, target_pts)
                     if poly_dist is not None:
                         raw_dist = poly_dist * 1000.0
                         
@@ -527,9 +512,13 @@ class CameraWorker(QThread):
                         filtered_dist = sum(self._distance_history) / len(self._distance_history)
                         results['polyline_dist'] = filtered_dist
                         
-                        # Project polyline path to 2D
-                        self._draw_polyline(color_image, target_pts_to_use, cam_matrix, dist_coeffs)
-                        # Project and draw shortest path vector to polyline
+                        # Split target IDs into even and odd to represent the surface mesh
+                        even_ids = [tid for tid in target_ids if tid % 2 == 0]
+                        odd_ids = [tid for tid in target_ids if tid % 2 != 0]
+                        
+                        # Draw surface mesh connecting even and odd target tags
+                        self._draw_surface_mesh(color_image, target_map, even_ids, odd_ids, cam_matrix, dist_coeffs)
+                        # Draw shortest path vector perpendicular to the fitted plane
                         self._draw_distance_vector(color_image, source_pos, poly_closest_3d, 
                                                    cam_matrix, dist_coeffs, (0, 255, 0), "Khoảng cách", filtered_dist)
                 else:
@@ -603,6 +592,39 @@ class CameraWorker(QThread):
                 best_closest = closest
         return min_dist, best_closest
 
+    def _distance_point_to_fitted_plane(self, p, qs):
+        """
+        Fits a plane to a set of 3D points qs: ax + by + cz + d = 0
+        and returns the perpendicular distance from point p to the plane, 
+        along with the projected point on the plane.
+        """
+        N = len(qs)
+        if N == 0:
+            return None, None
+        if N == 1:
+            dist = np.linalg.norm(p - qs[0])
+            return dist, qs[0]
+        if N == 2:
+            return self._distance_point_to_segment(p, qs[0], qs[1])
+            
+        pts = np.array(qs)
+        centroid = np.mean(pts, axis=0)
+        centered = pts - centroid
+        
+        try:
+            _, _, vh = np.linalg.svd(centered)
+            normal = vh[2]
+            normal = normal / np.linalg.norm(normal)
+            
+            # Perpendicular distance from p to the plane
+            dist = abs(np.dot(normal, p - centroid))
+            # Projection of p onto the plane
+            p_proj = p - np.dot(normal, p - centroid) * normal
+            return dist, p_proj
+        except Exception:
+            # Fallback to segment in case SVD has issues
+            return self._distance_point_to_segment(p, qs[0], qs[-1])
+
     # Drawing helpers
     def _project_points_3d_to_2d(self, pts_3d, cam_matrix, dist_coeffs):
         pts_3d = np.array(pts_3d, dtype=np.float32).reshape(-1, 3)
@@ -625,6 +647,37 @@ class CameraWorker(QThread):
         # Draw vertices
         for pt in pts_2d:
             cv2.circle(image, (int(pt[0]), int(pt[1])), 6, (0, 255, 255), -1)
+
+    def _draw_surface_mesh(self, image, target_map, even_ids, odd_ids, cam_matrix, dist_coeffs):
+        # Find detected even and odd targets
+        even_detected = [tid for tid in even_ids if tid in target_map]
+        odd_detected = [tid for tid in odd_ids if tid in target_map]
+        
+        # Draw even line (yellow)
+        if len(even_detected) > 1:
+            pts_even = [target_map[tid] for tid in even_detected]
+            pts_2d = self._project_points_3d_to_2d(pts_even, cam_matrix, dist_coeffs)
+            for i in range(len(pts_2d) - 1):
+                cv2.line(image, tuple(pts_2d[i].astype(int)), tuple(pts_2d[i+1].astype(int)), (255, 255, 0), 2, cv2.LINE_AA)
+            for pt in pts_2d:
+                cv2.circle(image, (int(pt[0]), int(pt[1])), 6, (255, 255, 0), -1)
+                
+        # Draw odd line (cyan)
+        if len(odd_detected) > 1:
+            pts_odd = [target_map[tid] for tid in odd_detected]
+            pts_2d = self._project_points_3d_to_2d(pts_odd, cam_matrix, dist_coeffs)
+            for i in range(len(pts_2d) - 1):
+                cv2.line(image, tuple(pts_2d[i].astype(int)), tuple(pts_2d[i+1].astype(int)), (0, 229, 255), 2, cv2.LINE_AA)
+            for pt in pts_2d:
+                cv2.circle(image, (int(pt[0]), int(pt[1])), 6, (0, 229, 255), -1)
+                
+        # Draw cross lines connecting them (orange)
+        min_len = min(len(even_detected), len(odd_detected))
+        for i in range(min_len):
+            p_even = target_map[even_detected[i]]
+            p_odd = target_map[odd_detected[i]]
+            pts_2d = self._project_points_3d_to_2d([p_even, p_odd], cam_matrix, dist_coeffs)
+            cv2.line(image, tuple(pts_2d[0].astype(int)), tuple(pts_2d[1].astype(int)), (255, 165, 0), 1, cv2.LINE_AA)
 
     def _draw_distance_vector(self, image, p_src, p_dst, cam_matrix, dist_coeffs, color, label, distance_mm):
         proj_pts = self._project_points_3d_to_2d([p_src, p_dst], cam_matrix, dist_coeffs)
