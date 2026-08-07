@@ -653,7 +653,28 @@ class CameraWorker(QThread):
         even_detected = [tid for tid in even_ids if tid in target_map]
         odd_detected = [tid for tid in odd_ids if tid in target_map]
         
-        # Draw even line (yellow)
+        # 1. Fill the surface patches with transparency (60% transparency, 40% opacity)
+        if len(even_detected) > 1 and len(odd_detected) > 1:
+            overlay = image.copy()
+            num_patches = min(len(even_detected), len(odd_detected)) - 1
+            for i in range(num_patches):
+                p1 = target_map[even_detected[i]]
+                p2 = target_map[even_detected[i+1]]
+                p3 = target_map[odd_detected[i+1]]
+                p4 = target_map[odd_detected[i]]
+                
+                # Project 3D quad vertices to 2D
+                pts_2d = self._project_points_3d_to_2d([p1, p2, p3, p4], cam_matrix, dist_coeffs)
+                pts_2d_int = pts_2d.astype(np.int32).reshape((-1, 1, 2))
+                
+                # Fill polygon with a modern holographic cyan-blue color (BGR: 255, 128, 0)
+                cv2.fillPoly(overlay, [pts_2d_int], (255, 128, 0))
+                
+            # Alpha blending: 0.4 opacity (60% transparency)
+            alpha = 0.4
+            cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0, image)
+        
+        # 2. Draw even boundary line (yellow)
         if len(even_detected) > 1:
             pts_even = [target_map[tid] for tid in even_detected]
             pts_2d = self._project_points_3d_to_2d(pts_even, cam_matrix, dist_coeffs)
@@ -662,7 +683,7 @@ class CameraWorker(QThread):
             for pt in pts_2d:
                 cv2.circle(image, (int(pt[0]), int(pt[1])), 6, (255, 255, 0), -1)
                 
-        # Draw odd line (cyan)
+        # 3. Draw odd boundary line (cyan)
         if len(odd_detected) > 1:
             pts_odd = [target_map[tid] for tid in odd_detected]
             pts_2d = self._project_points_3d_to_2d(pts_odd, cam_matrix, dist_coeffs)
@@ -671,7 +692,7 @@ class CameraWorker(QThread):
             for pt in pts_2d:
                 cv2.circle(image, (int(pt[0]), int(pt[1])), 6, (0, 229, 255), -1)
                 
-        # Draw cross lines connecting them (orange)
+        # 4. Draw cross lines connecting them (orange)
         min_len = min(len(even_detected), len(odd_detected))
         for i in range(min_len):
             p_even = target_map[even_detected[i]]
