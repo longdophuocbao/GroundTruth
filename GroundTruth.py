@@ -934,6 +934,7 @@ class GroundTruthApp(QMainWindow):
         self.plot_widget.setTitle("ĐỒ THỊ KHOẢNG CÁCH THEO THỜI GIAN (MM)", color='#00e5ff', size='10pt')
         self.plot_widget.setLabel('left', 'Khoảng cách', units='mm', color='#d1d1d1')
         self.plot_widget.setLabel('bottom', 'Thời gian', units='s', color='#d1d1d1')
+        self.plot_widget.setYRange(100, 400, padding=0)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
         
         # Plot curve
