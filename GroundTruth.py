@@ -92,7 +92,7 @@ class CameraWorker(QThread):
         self._enable_spatial = False
         self._enable_temporal = False
         self._enable_threshold = False
-        self._threshold_min = 0.15
+        self._threshold_min = 1.0
         self._threshold_max = 4.0
         
         self._trackers = {}
@@ -493,8 +493,25 @@ class CameraWorker(QThread):
                 
                 # Compute distance to polyline if source and targets are detected
                 if source_pos is not None and len(target_pts) > 0:
+                    src_tag = active_tags[source_id]
+                    # Project target points onto the local XY plane of the source tag (ID1) if rvec is available
+                    if src_tag.get('rvec') is not None:
+                        R_src, _ = cv2.Rodrigues(src_tag['rvec'])
+                        target_pts_proj = []
+                        for q in target_pts:
+                            # Transform to local coordinate system of ID1
+                            q_local = R_src.T @ (q - source_pos)
+                            # Project onto the local XY plane by setting the local Z component to 0
+                            q_proj_local = np.array([q_local[0], q_local[1], 0.0])
+                            # Transform back to camera coordinates
+                            q_proj_cam = R_src @ q_proj_local + source_pos
+                            target_pts_proj.append(q_proj_cam)
+                        target_pts_to_use = target_pts_proj
+                    else:
+                        target_pts_to_use = target_pts
+
                     # Polyline distance
-                    poly_dist, poly_closest_3d = self._distance_point_to_polyline(source_pos, target_pts)
+                    poly_dist, poly_closest_3d = self._distance_point_to_polyline(source_pos, target_pts_to_use)
                     if poly_dist is not None:
                         raw_dist = poly_dist * 1000.0
                         
@@ -511,7 +528,7 @@ class CameraWorker(QThread):
                         results['polyline_dist'] = filtered_dist
                         
                         # Project polyline path to 2D
-                        self._draw_polyline(color_image, target_pts, cam_matrix, dist_coeffs)
+                        self._draw_polyline(color_image, target_pts_to_use, cam_matrix, dist_coeffs)
                         # Project and draw shortest path vector to polyline
                         self._draw_distance_vector(color_image, source_pos, poly_closest_3d, 
                                                    cam_matrix, dist_coeffs, (0, 255, 0), "Khoảng cách", filtered_dist)
@@ -732,29 +749,29 @@ class SettingsDialog(QDialog):
         realsense_grid = QGridLayout(realsense_group)
         
         self.chk_decimation = QCheckBox("Decimation Filter (Giảm độ phân giải)")
-        self.chk_decimation.setChecked(False)
+        self.chk_decimation.setChecked(True)
         realsense_grid.addWidget(self.chk_decimation, 0, 0)
         
         self.chk_hole_filling = QCheckBox("Hole Filling Filter (Vá lỗ thủng)")
-        self.chk_hole_filling.setChecked(False)
+        self.chk_hole_filling.setChecked(True)
         realsense_grid.addWidget(self.chk_hole_filling, 0, 1)
         
         self.chk_spatial = QCheckBox("Spatial Filter (Làm mịn không gian)")
-        self.chk_spatial.setChecked(False)
+        self.chk_spatial.setChecked(True)
         realsense_grid.addWidget(self.chk_spatial, 1, 0)
         
         self.chk_temporal = QCheckBox("Temporal Filter (Làm mịn theo thời gian)")
-        self.chk_temporal.setChecked(False)
+        self.chk_temporal.setChecked(True)
         realsense_grid.addWidget(self.chk_temporal, 1, 1)
         
         self.chk_threshold = QCheckBox("Threshold Filter (Bộ lọc ngưỡng)")
-        self.chk_threshold.setChecked(False)
+        self.chk_threshold.setChecked(True)
         realsense_grid.addWidget(self.chk_threshold, 2, 0, 1, 2)
         
         realsense_grid.addWidget(QLabel("Ngưỡng Min (mét):"), 3, 0)
         self.sb_threshold_min = QDoubleSpinBox()
         self.sb_threshold_min.setRange(0.1, 10.0)
-        self.sb_threshold_min.setValue(0.15)
+        self.sb_threshold_min.setValue(1.0)
         self.sb_threshold_min.setSingleStep(0.05)
         realsense_grid.addWidget(self.sb_threshold_min, 3, 1)
         
