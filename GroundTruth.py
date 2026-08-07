@@ -94,6 +94,7 @@ class CameraWorker(QThread):
         self._enable_threshold = False
         self._threshold_min = 1.0
         self._threshold_max = 4.0
+        self._laser_power = 150
         
         self._trackers = {}
         self._distance_history = []
@@ -110,7 +111,7 @@ class CameraWorker(QThread):
     def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
                       filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                       enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                      threshold_min, threshold_max):
+                      threshold_min, threshold_max, laser_power):
         with QMutexLocker(self._mutex):
             self._tag_size = tag_size
             self._source_id = source_id
@@ -128,6 +129,7 @@ class CameraWorker(QThread):
             self._enable_threshold = enable_threshold
             self._threshold_min = threshold_min
             self._threshold_max = threshold_max
+            self._laser_power = laser_power
 
     def stop(self):
         self.running = False
@@ -192,6 +194,8 @@ class CameraWorker(QThread):
         
         try:
             profile = pipeline.start(config)
+            device = profile.get_device()
+            depth_sensor = device.first_depth_sensor()
             self.status_msg.emit("Đang kết nối. Pipeline bắt đầu hoạt động.")
         except Exception as e:
             self.error_occurred.emit(f"Không thể khởi động camera: {str(e)}")
@@ -267,6 +271,16 @@ class CameraWorker(QThread):
                     enable_threshold = self._enable_threshold
                     threshold_min = self._threshold_min
                     threshold_max = self._threshold_max
+                    laser_power = self._laser_power
+                
+                # Apply Laser Power dynamically
+                if depth_sensor and depth_sensor.supports(rs.option.laser_power):
+                    try:
+                        current_val = depth_sensor.get_option(rs.option.laser_power)
+                        if abs(current_val - laser_power) > 0.01:
+                            depth_sensor.set_option(rs.option.laser_power, float(laser_power))
+                    except Exception:
+                        pass
                 
                 # Apply RealSense SDK post-processing filters to depth_frame
                 if enable_threshold:
@@ -790,7 +804,7 @@ class SettingsDialog(QDialog):
         tracking_grid = QGridLayout(tracking_group)
         
         self.chk_enable_smoothing = QCheckBox("Kích hoạt bộ lọc mượt 3D (EMA)")
-        self.chk_enable_smoothing.setChecked(True)
+        self.chk_enable_smoothing.setChecked(False)
         tracking_grid.addWidget(self.chk_enable_smoothing, 0, 0, 1, 2)
         
         tracking_grid.addWidget(QLabel("Độ phản hồi bộ lọc (Alpha):"), 1, 0)
@@ -801,7 +815,7 @@ class SettingsDialog(QDialog):
         tracking_grid.addWidget(self.sb_filter_alpha, 1, 1)
         
         self.chk_enable_keep_alive = QCheckBox("Duy trì trạng thái khi mất dấu tạm thời")
-        self.chk_enable_keep_alive.setChecked(True)
+        self.chk_enable_keep_alive.setChecked(False)
         tracking_grid.addWidget(self.chk_enable_keep_alive, 2, 0, 1, 2)
         
         tracking_grid.addWidget(QLabel("Khung hình duy trì tối đa (Max Lost):"), 3, 0)
@@ -823,7 +837,7 @@ class SettingsDialog(QDialog):
         realsense_grid = QGridLayout(realsense_group)
         
         self.chk_decimation = QCheckBox("Decimation Filter (Giảm độ phân giải)")
-        self.chk_decimation.setChecked(True)
+        self.chk_decimation.setChecked(False)
         realsense_grid.addWidget(self.chk_decimation, 0, 0)
         
         self.chk_hole_filling = QCheckBox("Hole Filling Filter (Vá lỗ thủng)")
@@ -855,6 +869,14 @@ class SettingsDialog(QDialog):
         self.sb_threshold_max.setValue(4.0)
         self.sb_threshold_max.setSingleStep(0.1)
         realsense_grid.addWidget(self.sb_threshold_max, 4, 1)
+        
+        realsense_grid.addWidget(QLabel("Công suất phát Laser (mW):"), 5, 0)
+        self.sb_laser_power = QSpinBox()
+        self.sb_laser_power.setRange(0, 360)
+        self.sb_laser_power.setValue(150)
+        self.sb_laser_power.setSingleStep(10)
+        self.sb_laser_power.setSuffix(" mW")
+        realsense_grid.addWidget(self.sb_laser_power, 5, 1)
         
         layout.addWidget(realsense_group)
         
@@ -935,6 +957,7 @@ class SettingsDialog(QDialog):
             self.chk_threshold.stateChanged.connect(parent.push_config_to_worker)
             self.sb_threshold_min.valueChanged.connect(parent.push_config_to_worker)
             self.sb_threshold_max.valueChanged.connect(parent.push_config_to_worker)
+            self.sb_laser_power.valueChanged.connect(parent.push_config_to_worker)
 
 
 class GroundTruthApp(QMainWindow):
@@ -1310,11 +1333,12 @@ class GroundTruthApp(QMainWindow):
         enable_threshold = self.settings_dialog.chk_threshold.isChecked()
         threshold_min = self.settings_dialog.sb_threshold_min.value()
         threshold_max = self.settings_dialog.sb_threshold_max.value()
+        laser_power = self.settings_dialog.sb_laser_power.value()
         
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                                   enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                                  threshold_min, threshold_max)
+                                  threshold_min, threshold_max, laser_power)
         
     def scan_devices(self):
         self.status_bar_lbl.setText("Đang quét thiết bị camera...")
