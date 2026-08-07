@@ -875,6 +875,10 @@ class GroundTruthApp(QMainWindow):
         self.plot_start_time = None
         self.max_history_points = 300 # scrolling window size (e.g. 10s at 30fps)
         
+        # FPS tracker
+        self.fps_timer = time.time()
+        self.fps_counter = 0
+        
         self.init_ui()
         self.apply_stylesheet()
         
@@ -942,9 +946,19 @@ class GroundTruthApp(QMainWindow):
         left_layout.addWidget(self.plot_widget, 2) # Stretch factor 2
         
         # Quick status bar inside left layout
+        status_bar_layout = QHBoxLayout()
+        
         self.status_bar_lbl = QLabel("Hệ thống đã sẵn sàng.")
         self.status_bar_lbl.setObjectName("lbl_status_bar")
-        left_layout.addWidget(self.status_bar_lbl)
+        
+        self.fps_lbl = QLabel("FPS: N/A")
+        self.fps_lbl.setObjectName("lbl_status_bar")
+        self.fps_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        
+        status_bar_layout.addWidget(self.status_bar_lbl)
+        status_bar_layout.addWidget(self.fps_lbl)
+        
+        left_layout.addLayout(status_bar_layout)
         
         main_layout.addLayout(left_layout, 2)
         
@@ -1265,6 +1279,10 @@ class GroundTruthApp(QMainWindow):
         self.btn_scan.setEnabled(False)
         self.settings_dialog.sb_source_id.setEnabled(False)
         
+        # Reset FPS calculation variables
+        self.fps_timer = time.time()
+        self.fps_counter = 0
+        
         self.worker.start()
         
     def stop_camera_stream(self):
@@ -1290,6 +1308,10 @@ class GroundTruthApp(QMainWindow):
         self.btn_toggle_stream.style().polish(self.btn_toggle_stream)
         self.btn_scan.setEnabled(True)
         self.settings_dialog.sb_source_id.setEnabled(True)
+        
+        # Reset FPS
+        self.fps_lbl.setText("FPS: N/A")
+        self.fps_counter = 0
         
     def toggle_depth_visibility(self, state):
         if state == Qt.Checked.value or state is True:
@@ -1333,6 +1355,15 @@ class GroundTruthApp(QMainWindow):
  
     @Slot(np.ndarray, dict)
     def update_frame(self, frame_bgr, results):
+        # Calculate FPS
+        self.fps_counter += 1
+        now = time.time()
+        if now - self.fps_timer >= 1.0:
+            current_fps = self.fps_counter / (now - self.fps_timer)
+            self.fps_lbl.setText(f"FPS: {current_fps:.1f}")
+            self.fps_counter = 0
+            self.fps_timer = now
+            
         # Convert BGR from OpenCV to RGB for QImage
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w, ch = frame_rgb.shape
