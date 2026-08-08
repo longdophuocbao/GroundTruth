@@ -1,5 +1,54 @@
 import os
 import sys
+
+# Add ZED SDK and CUDA bin directories to PATH and DLL search path for Python 3.8+ on Windows
+if sys.platform == "win32":
+    # 1. Prepend ZED SDK and CUDA paths to system PATH for native LoadLibrary calls from C++ DLLs
+    zed_sdk_paths = [
+        r"C:\Program Files\ZED SDK\bin",
+        r"C:\Program Files (x86)\ZED SDK\bin"
+    ]
+    for path in zed_sdk_paths:
+        if os.path.exists(path):
+            os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(path)
+                except Exception:
+                    pass
+                    
+    cuda_path = os.environ.get("CUDA_PATH")
+    if cuda_path:
+        cuda_bin = os.path.join(cuda_path, "bin")
+        if os.path.exists(cuda_bin):
+            os.environ["PATH"] = cuda_bin + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(cuda_bin)
+                except Exception:
+                    pass
+
+    # 2. DLL Auto-Fix: Copy sl_zed64.dll and sl_ai64.dll to pyzed's folder if needed to enforce DLL loading rules
+    try:
+        import pyzed
+        pyzed_dir = os.path.dirname(pyzed.__file__)
+        if pyzed_dir and os.path.exists(pyzed_dir):
+            for path in zed_sdk_paths:
+                if os.path.exists(path):
+                    for dll_name in ["sl_zed64.dll", "sl_ai64.dll"]:
+                        src = os.path.join(path, dll_name)
+                        dst = os.path.join(pyzed_dir, dll_name)
+                        if os.path.exists(src):
+                            # Copy if missing or if file size is different to ensure matching version
+                            if not os.path.exists(dst) or os.path.getsize(src) != os.path.getsize(dst):
+                                try:
+                                    import shutil
+                                    shutil.copy2(src, dst)
+                                    print(f"[ZED DLL Auto-Fix] Đã sao chép {dll_name} vào {pyzed_dir}")
+                                except Exception as e:
+                                    print(f"[ZED DLL Auto-Fix] Lỗi khi sao chép {dll_name}: {e}")
+    except Exception as e:
+        print(f"[ZED DLL Auto-Fix] Không thể tự động kiểm tra/sao chép DLL: {e}")
 import time
 import csv
 import json
@@ -268,8 +317,9 @@ class ZED2iSDKCameraDevice(BaseCameraDevice):
         self.image = None
         self.depth = None
         self.sensors_data = None
+        self.depth_max_limit = 5.0
         
-    def open(self):
+    def open(self, zed_config=None):
         try:
             import pyzed.sl as sl
         except ImportError:
@@ -285,9 +335,47 @@ class ZED2iSDKCameraDevice(BaseCameraDevice):
         self.init_params = sl.InitParameters()
         self.init_params.camera_resolution = sl.RESOLUTION.HD720
         self.init_params.camera_fps = 30
-        self.init_params.depth_mode = sl.DEPTH_MODE.ULTRA  # GPU CUDA accelerated depth matching
+        
+        # Áp dụng depth_mode từ cấu hình
+        depth_mode_str = "NEURAL"
+        if zed_config and 'depth_mode' in zed_config:
+            depth_mode_str = zed_config['depth_mode']
+            
+        depth_mode_map = {}
+        if hasattr(sl, 'DEPTH_MODE'):
+            # ZED SDK 5 Neural modes
+            if hasattr(sl.DEPTH_MODE, 'NEURAL_PLUS'):
+                depth_mode_map["NEURAL_PLUS"] = sl.DEPTH_MODE.NEURAL_PLUS
+            if hasattr(sl.DEPTH_MODE, 'NEURAL'):
+                depth_mode_map["NEURAL"] = sl.DEPTH_MODE.NEURAL
+            if hasattr(sl.DEPTH_MODE, 'NEURAL_LIGHT'):
+                depth_mode_map["NEURAL_LIGHT"] = sl.DEPTH_MODE.NEURAL_LIGHT
+            
+            # Classical/Older SDK modes
+            if hasattr(sl.DEPTH_MODE, 'ULTRA'):
+                depth_mode_map["ULTRA"] = sl.DEPTH_MODE.ULTRA
+            if hasattr(sl.DEPTH_MODE, 'QUALITY'):
+                depth_mode_map["QUALITY"] = sl.DEPTH_MODE.QUALITY
+            if hasattr(sl.DEPTH_MODE, 'PERFORMANCE'):
+                depth_mode_map["PERFORMANCE"] = sl.DEPTH_MODE.PERFORMANCE
+                
+        # Thiết lập mặc định nếu chế độ đã chọn không tồn tại trên hệ thống
+        default_mode = sl.DEPTH_MODE.NEURAL if hasattr(sl.DEPTH_MODE, 'NEURAL') else (sl.DEPTH_MODE.ULTRA if hasattr(sl.DEPTH_MODE, 'ULTRA') else sl.DEPTH_MODE.QUALITY)
+        
+        self.init_params.depth_mode = depth_mode_map.get(depth_mode_str, default_mode)
         self.init_params.coordinate_units = sl.UNIT.METER
+        
+        # Thiết lập khoảng cách depth tối thiểu/tối đa trong tham số khởi tạo
+        if zed_config and 'depth_min' in zed_config:
+            self.init_params.depth_minimum_distance = float(zed_config['depth_min'])
+        if zed_config and 'depth_max' in zed_config:
+            self.init_params.depth_maximum_distance = float(zed_config['depth_max'])
+            self.depth_max_limit = float(zed_config['depth_max'])
+        else:
+            self.depth_max_limit = 5.0
+            
         self.runtime_params = sl.RuntimeParameters()
+        self.apply_runtime_config(zed_config)
         
         self.image = sl.Mat()
         self.depth = sl.Mat()
@@ -295,10 +383,57 @@ class ZED2iSDKCameraDevice(BaseCameraDevice):
         
         err = self.zed.open(self.init_params)
         if err != sl.ERROR_CODE.SUCCESS:
-            return False, f"Không thể kết nối ZED Camera qua SDK: {err}"
+            # Nếu gặp lỗi khi khởi động bằng các chế độ NEURAL (thường do lỗi dll AI sl_ai64.dll của ZED)
+            is_neural = depth_mode_str in ["NEURAL", "NEURAL_PLUS", "NEURAL_LIGHT"]
+            if is_neural:
+                print(f"[ZED Warning] Không thể mở camera ở chế độ {depth_mode_str} (Lỗi AI/Neural). Đang thử tự động chuyển sang chế độ ULTRA (Không dùng AI)...")
+                if hasattr(sl.DEPTH_MODE, 'ULTRA'):
+                    self.init_params.depth_mode = sl.DEPTH_MODE.ULTRA
+                elif hasattr(sl.DEPTH_MODE, 'QUALITY'):
+                    self.init_params.depth_mode = sl.DEPTH_MODE.QUALITY
+                else:
+                    self.init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
+                
+                err = self.zed.open(self.init_params)
+                if err == sl.ERROR_CODE.SUCCESS:
+                    return True, f"Khởi động ZED 2i thành công (Đã tự động chuyển về chế độ ULTRA không dùng AI do lỗi thư viện sl_ai64.dll của ZED SDK)."
+            
+            return False, (
+                f"Không thể kết nối ZED Camera qua SDK: {err}.\n\n"
+                "Nguyên nhân có thể do lỗi cài đặt module AI của ZED SDK (thiếu TensorRT, CUDA hoặc file 'sl_ai64.dll' bị lỗi).\n"
+                "Giải pháp:\n"
+                "1. Chạy ZED Diagnostics để kiểm tra lỗi thư viện.\n"
+                "2. Cài đặt lại ZED SDK và tick chọn phần AI/Object Detection.\n"
+                "3. Vào Cài Đặt (Settings) trong ứng dụng và chuyển sang chế độ chiều sâu không dùng AI (như ULTRA hoặc QUALITY)."
+            )
             
         return True, "Khởi động ZED 2i SDK (CUDA) thành công."
         
+    def apply_runtime_config(self, zed_config):
+        if not zed_config:
+            return
+        try:
+            import pyzed.sl as sl
+            # Chế độ cảm nhận (Sensing Mode) hoặc Vá lỗ hổng (Fill Mode) tùy theo phiên bản SDK
+            sensing_mode_str = zed_config.get('sensing_mode', 'STANDARD')
+            is_fill = (sensing_mode_str == 'FILL')
+            if hasattr(sl, 'SENSING_MODE'):
+                if is_fill:
+                    self.runtime_params.sensing_mode = sl.SENSING_MODE.FILL
+                else:
+                    self.runtime_params.sensing_mode = sl.SENSING_MODE.STANDARD
+            elif hasattr(self.runtime_params, 'enable_fill_mode'):
+                self.runtime_params.enable_fill_mode = is_fill
+                
+            # Ngưỡng tin cậy (Confidence)
+            self.runtime_params.confidence_threshold = int(zed_config.get('confidence', 95))
+            self.runtime_params.texture_confidence_threshold = int(zed_config.get('texture_confidence', 100))
+            
+            if 'depth_max' in zed_config:
+                self.depth_max_limit = float(zed_config['depth_max'])
+        except Exception as e:
+            print(f"Lỗi khi áp dụng runtime config cho ZED: {e}")
+            
     def close(self):
         if self.zed:
             try:
@@ -311,6 +446,10 @@ class ZED2iSDKCameraDevice(BaseCameraDevice):
         import pyzed.sl as sl
         if not self.zed or not self.zed.is_opened():
             return False, None, None, None, None
+            
+        # Áp dụng runtime config nếu được chuyển qua filters_config
+        if filters_config and 'zed_config' in filters_config:
+            self.apply_runtime_config(filters_config['zed_config'])
             
         if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
             # 1. Get Left Image
@@ -363,10 +502,10 @@ class ZED2iSDKCameraDevice(BaseCameraDevice):
         return False, None, None, None, None
 
     def get_colorized_depth(self, depth_frame):
-        # Generate custom colored depth map for display on GUI
+        # Tạo bản đồ chiều sâu dạng ảnh màu để hiển thị
         depth_matrix = depth_frame.depth_matrix.copy()
         depth_matrix[np.isnan(depth_matrix) | np.isinf(depth_matrix)] = 0.0
-        max_dist = 5.0
+        max_dist = getattr(self, 'depth_max_limit', 5.0)
         depth_scaled = np.clip(depth_matrix / max_dist * 255.0, 0, 255).astype(np.uint8)
         color_depth = cv2.applyColorMap(depth_scaled, cv2.COLORMAP_JET)
         color_depth[depth_matrix == 0.0] = 0
@@ -454,6 +593,16 @@ class CameraWorker(QThread):
         self._threshold_max = 4.0
         self._laser_power = 150
         
+        # ZED SDK Config default parameters
+        self._zed_config = {
+            'depth_mode': 'ULTRA',
+            'sensing_mode': 'STANDARD',
+            'confidence': 95,
+            'texture_confidence': 100,
+            'depth_min': 0.4,
+            'depth_max': 20.0
+        }
+        
         # Reference Map state
         self._use_ref_map = False
         self._reference_map = None
@@ -483,7 +632,8 @@ class CameraWorker(QThread):
     def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
                       filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                       enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                      threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type="realsense"):
+                      threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type="realsense",
+                      zed_config=None):
         with QMutexLocker(self._mutex):
             self._tag_size = tag_size
             self._source_id = source_id
@@ -506,6 +656,8 @@ class CameraWorker(QThread):
             self._reference_map = reference_map
             self._use_imu = use_imu
             self._camera_type = camera_type
+            if zed_config is not None:
+                self._zed_config = zed_config
             self._filtered_R_A = None
             self._filtered_P_A = None
 
@@ -564,6 +716,7 @@ class CameraWorker(QThread):
         # Đọc camera_type trong thread-safe
         with QMutexLocker(self._mutex):
             camera_type = self._camera_type
+            zed_config = self._zed_config.copy() if hasattr(self, '_zed_config') else None
             
         if camera_type == "realsense":
             self.status_msg.emit("Đang khởi tạo camera RealSense...")
@@ -575,7 +728,10 @@ class CameraWorker(QThread):
             self.status_msg.emit("Đang khởi tạo camera ZED 2i (UVC Mode)...")
             camera = ZED2iUVCCameraDevice(camera_index=0)
             
-        success, msg = camera.open()
+        if camera_type == "zed_sdk":
+            success, msg = camera.open(zed_config)
+        else:
+            success, msg = camera.open()
         if not success:
             self.error_occurred.emit(msg)
             self.running = False
@@ -623,7 +779,8 @@ class CameraWorker(QThread):
                         'enable_temporal': self._enable_temporal,
                         'enable_threshold': self._enable_threshold,
                         'threshold_min': self._threshold_min,
-                        'threshold_max': self._threshold_max
+                        'threshold_max': self._threshold_max,
+                        'zed_config': self._zed_config
                     }
                     laser_power = self._laser_power
                     use_ref_map = self._use_ref_map
@@ -1451,8 +1608,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(tracking_group)
         
         # 2.5 RealSense SDK Post-Processing filters
-        realsense_group = QGroupBox("BỘ LỌC CHIỀU SÂU REALSENSE (POST-PROCESSING)")
-        realsense_grid = QGridLayout(realsense_group)
+        self.realsense_group = QGroupBox("BỘ LỌC CHIỀU SÂU REALSENSE (POST-PROCESSING)")
+        realsense_grid = QGridLayout(self.realsense_group)
         
         self.chk_decimation = QCheckBox("Decimation Filter (Giảm độ phân giải)")
         self.chk_decimation.setChecked(False)
@@ -1496,7 +1653,68 @@ class SettingsDialog(QDialog):
         self.sb_laser_power.setSuffix(" mW")
         realsense_grid.addWidget(self.sb_laser_power, 5, 1)
         
-        layout.addWidget(realsense_group)
+        layout.addWidget(self.realsense_group)
+        
+        # 2.6 ZED SDK Depth Configuration
+        self.zed_sdk_group = QGroupBox("CẤU HÌNH CHIỀU SÂU ZED SDK (CUDA)")
+        zed_grid = QGridLayout(self.zed_sdk_group)
+        
+        zed_grid.addWidget(QLabel("Chế độ Depth Mode:"), 0, 0)
+        self.cb_zed_depth_mode = QComboBox()
+        # ZED SDK 5.x Neural modes (Khuyên dùng)
+        self.cb_zed_depth_mode.addItem("NEURAL_PLUS (Độ chính xác tối đa - AI+)", "NEURAL_PLUS")
+        self.cb_zed_depth_mode.addItem("NEURAL (Cân bằng - AI)", "NEURAL")
+        self.cb_zed_depth_mode.addItem("NEURAL_LIGHT (Tốc độ cao - AI Light)", "NEURAL_LIGHT")
+        # Legacy/Fallback modes cho các phiên bản SDK cũ
+        self.cb_zed_depth_mode.addItem("ULTRA (Độ chính xác cao - Cũ)", "ULTRA")
+        self.cb_zed_depth_mode.addItem("QUALITY (Chất lượng tốt - Cũ)", "QUALITY")
+        self.cb_zed_depth_mode.addItem("PERFORMANCE (Hiệu năng cao - Cũ)", "PERFORMANCE")
+        self.cb_zed_depth_mode.setCurrentIndex(1) # Mặc định: NEURAL (Cân bằng - AI)
+        zed_grid.addWidget(self.cb_zed_depth_mode, 0, 1)
+        
+        zed_grid.addWidget(QLabel("Chế độ Sensing Mode:"), 1, 0)
+        self.cb_zed_sensing_mode = QComboBox()
+        self.cb_zed_sensing_mode.addItem("STANDARD (Tiêu chuẩn)", "STANDARD")
+        self.cb_zed_sensing_mode.addItem("FILL (Lấp đầy khoảng trống - Vá lỗ)", "FILL")
+        self.cb_zed_sensing_mode.setCurrentIndex(0) # Default: STANDARD
+        zed_grid.addWidget(self.cb_zed_sensing_mode, 1, 1)
+        
+        zed_grid.addWidget(QLabel("Ngưỡng tin cậy (Confidence):"), 2, 0)
+        self.sb_zed_confidence = QSpinBox()
+        self.sb_zed_confidence.setRange(1, 100)
+        self.sb_zed_confidence.setValue(95)
+        zed_grid.addWidget(self.sb_zed_confidence, 2, 1)
+        
+        zed_grid.addWidget(QLabel("Ngưỡng vân bề mặt (Texture Confidence):"), 3, 0)
+        self.sb_zed_texture_confidence = QSpinBox()
+        self.sb_zed_texture_confidence.setRange(1, 100)
+        self.sb_zed_texture_confidence.setValue(100)
+        zed_grid.addWidget(self.sb_zed_texture_confidence, 3, 1)
+        
+        zed_grid.addWidget(QLabel("Khoảng cách Depth Min (mét):"), 4, 0)
+        self.sb_zed_depth_min = QDoubleSpinBox()
+        self.sb_zed_depth_min.setRange(0.1, 10.0)
+        self.sb_zed_depth_min.setValue(0.4)
+        self.sb_zed_depth_min.setSingleStep(0.05)
+        zed_grid.addWidget(self.sb_zed_depth_min, 4, 1)
+        
+        zed_grid.addWidget(QLabel("Khoảng cách Depth Max (mét):"), 5, 0)
+        self.sb_zed_depth_max = QDoubleSpinBox()
+        self.sb_zed_depth_max.setRange(1.0, 40.0)
+        self.sb_zed_depth_max.setValue(20.0)
+        self.sb_zed_depth_max.setSingleStep(0.5)
+        zed_grid.addWidget(self.sb_zed_depth_max, 5, 1)
+        
+        layout.addWidget(self.zed_sdk_group)
+        
+        # 2.7 ZED UVC Info
+        self.zed_uvc_group = QGroupBox("THÔNG TIN ZED UVC")
+        zed_uvc_layout = QVBoxLayout(self.zed_uvc_group)
+        self.lbl_zed_uvc_info = QLabel("Chế độ ZED 2i UVC không hỗ trợ luồng chiều sâu phần cứng.\nHệ thống sẽ sử dụng thuật toán SolvePnP để tính khoảng cách.")
+        self.lbl_zed_uvc_info.setStyleSheet("color: #ffb74d;")
+        self.lbl_zed_uvc_info.setWordWrap(True)
+        zed_uvc_layout.addWidget(self.lbl_zed_uvc_info)
+        layout.addWidget(self.zed_uvc_group)
         
         # 3. Dialog buttons
         buttons_layout = QHBoxLayout()
@@ -1576,6 +1794,47 @@ class SettingsDialog(QDialog):
             self.sb_threshold_min.valueChanged.connect(parent.push_config_to_worker)
             self.sb_threshold_max.valueChanged.connect(parent.push_config_to_worker)
             self.sb_laser_power.valueChanged.connect(parent.push_config_to_worker)
+            
+            # ZED SDK signals
+            self.cb_zed_depth_mode.currentIndexChanged.connect(parent.push_config_to_worker)
+            self.cb_zed_sensing_mode.currentIndexChanged.connect(parent.push_config_to_worker)
+            self.sb_zed_confidence.valueChanged.connect(parent.push_config_to_worker)
+            self.sb_zed_texture_confidence.valueChanged.connect(parent.push_config_to_worker)
+            self.sb_zed_depth_min.valueChanged.connect(parent.push_config_to_worker)
+            self.sb_zed_depth_max.valueChanged.connect(parent.push_config_to_worker)
+
+    def update_camera_mode(self, camera_type):
+        if camera_type == "realsense":
+            self.realsense_group.show()
+            self.zed_sdk_group.hide()
+            self.zed_uvc_group.hide()
+            self.cb_coord_mode.setItemText(0, "Sử dụng Cảm biến Depth RealSense trực tiếp (Mặc định)")
+            model = self.cb_coord_mode.model()
+            if model and hasattr(model, 'item'):
+                item = model.item(0)
+                if item:
+                    item.setEnabled(True)
+        elif camera_type == "zed_sdk":
+            self.realsense_group.hide()
+            self.zed_sdk_group.show()
+            self.zed_uvc_group.hide()
+            self.cb_coord_mode.setItemText(0, "Sử dụng Cảm biến Depth ZED SDK (CUDA) trực tiếp (Mặc định)")
+            model = self.cb_coord_mode.model()
+            if model and hasattr(model, 'item'):
+                item = model.item(0)
+                if item:
+                    item.setEnabled(True)
+        elif camera_type == "zed_uvc":
+            self.realsense_group.hide()
+            self.zed_sdk_group.hide()
+            self.zed_uvc_group.show()
+            self.cb_coord_mode.setItemText(0, "Không khả dụng ở chế độ UVC")
+            model = self.cb_coord_mode.model()
+            if model and hasattr(model, 'item'):
+                item = model.item(0)
+                if item:
+                    item.setEnabled(False)
+            self.cb_coord_mode.setCurrentIndex(1) # Chuyển sang SolvePnP
 
 
 class GroundTruthApp(QMainWindow):
@@ -1594,6 +1853,7 @@ class GroundTruthApp(QMainWindow):
         
         # Initialize settings dialog
         self.settings_dialog = SettingsDialog(self)
+        self.settings_dialog.update_camera_mode("realsense")
         
         # Reference Map state
         self.reference_map = None
@@ -2019,6 +2279,16 @@ class GroundTruthApp(QMainWindow):
         reference_map = self.reference_map
         use_imu = self.chk_use_imu.isChecked()
         
+        # Read ZED SDK filters/settings
+        zed_config = {
+            'depth_mode': self.settings_dialog.cb_zed_depth_mode.currentData(),
+            'sensing_mode': self.settings_dialog.cb_zed_sensing_mode.currentData(),
+            'confidence': self.settings_dialog.sb_zed_confidence.value(),
+            'texture_confidence': self.settings_dialog.sb_zed_texture_confidence.value(),
+            'depth_min': self.settings_dialog.sb_zed_depth_min.value(),
+            'depth_max': self.settings_dialog.sb_zed_depth_max.value()
+        }
+        
         idx = self.cmb_camera_source.currentIndex()
         if idx == 1:
             camera_type = "zed_uvc"
@@ -2030,17 +2300,25 @@ class GroundTruthApp(QMainWindow):
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                                   enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                                  threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type)
+                                  threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type,
+                                  zed_config)
         
     def on_camera_source_changed(self, index):
         if index == 1:
             camera_type = "zed_uvc"
+            self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - ZED 2i (UVC Mode)")
         elif index == 2:
             camera_type = "zed_sdk"
+            self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - ZED 2i (ZED SDK CUDA Mode)")
         else:
             camera_type = "realsense"
+            self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - Intel RealSense D455")
             
+        # Cập nhật Settings Dialog dựa trên loại camera đang chọn
+        self.settings_dialog.update_camera_mode(camera_type)
+        
         if camera_type == "zed_uvc":
+            self.chk_use_imu.setText("Sử dụng cảm biến IMU (Không hỗ trợ ở UVC Mode)")
             self.chk_use_imu.setChecked(False)
             self.chk_use_imu.setEnabled(False)
             self.chk_show_depth.setChecked(False)
@@ -2048,6 +2326,7 @@ class GroundTruthApp(QMainWindow):
             self.status_bar_lbl.setText("Đã chuyển sang ZED 2i (UVC Mode). Khuyên dùng chế độ đo PnP.")
             self.settings_dialog.cb_coord_mode.setCurrentIndex(1) # pnp mode
         elif camera_type == "zed_sdk":
+            self.chk_use_imu.setText("Sử dụng cảm biến IMU (ZED 2i)")
             self.chk_use_imu.setEnabled(True)
             self.chk_use_imu.setChecked(True)
             self.chk_show_depth.setEnabled(True)
@@ -2055,11 +2334,14 @@ class GroundTruthApp(QMainWindow):
             self.status_bar_lbl.setText("Đã chuyển sang ZED 2i (ZED SDK CUDA Mode). Sử dụng GPU tính toán chiều sâu.")
             self.settings_dialog.cb_coord_mode.setCurrentIndex(0) # depth mode
         else:
+            self.chk_use_imu.setText("Sử dụng cảm biến IMU (D455)")
             self.chk_use_imu.setEnabled(True)
             self.chk_use_imu.setChecked(True)
             self.chk_show_depth.setEnabled(True)
             self.status_bar_lbl.setText("Đã chuyển sang Intel RealSense D455.")
             self.settings_dialog.cb_coord_mode.setCurrentIndex(0) # depth mode
+            
+        self.push_config_to_worker()
             
     def scan_devices(self):
         self.status_bar_lbl.setText("Đang quét thiết bị camera...")
