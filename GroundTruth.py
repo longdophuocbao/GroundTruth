@@ -786,7 +786,8 @@ class CameraWorker(QThread):
                     }
                     laser_power = self._laser_power
                     use_ref_map = self._use_ref_map
-                    reference_map = self._reference_map
+                    import copy
+                    reference_map = copy.deepcopy(self._reference_map) if self._reference_map is not None else None
                     use_imu = self._use_imu
                 
                 # Get frames from camera
@@ -1001,32 +1002,30 @@ class CameraWorker(QThread):
                                         local_map[str(tid)] = {
                                             'p_local': p_avg.tolist(),
                                             'r_local': r_avg.tolist()
-                                        }
-                                        
-                                # LƯU TRỮ VÀ GHÉP BẢN ĐỒ (MAP STITCHING)
-                                if getattr(self, '_reference_map', None) is None:
-                                    self._reference_map = {}
+                                        }                                # LƯU TRỮ VÀ GHÉP BẢN ĐỒ (MAP STITCHING)
+                                import copy
+                                ref_map_local = copy.deepcopy(self._reference_map) if getattr(self, '_reference_map', None) is not None else {}
                                     
-                                if not self._reference_map:
+                                if not ref_map_local:
                                     # Nếu bản đồ tổng trống, lấy bản đồ cục bộ làm bản đồ tổng
-                                    self._reference_map = local_map
-                                    self._calibration_anchor_id = temp_anchor
+                                    ref_map_local = copy.deepcopy(local_map)
+                                    calib_anchor_id = temp_anchor
                                 else:
                                     # Tìm các tag trùng lặp giữa bản đồ hiện tại và bản đồ tổng
-                                    common_ids = [tid for tid in local_map.keys() if tid in self._reference_map.keys()]
+                                    common_ids = [tid for tid in local_map.keys() if tid in ref_map_local.keys()]
                                     
                                     if len(common_ids) > 0:
                                         # Tính ma trận chuyển đổi từ Local Map sang Global Map
                                         if len(common_ids) >= 3:
                                             # Dùng thuật toán Kabsch nếu có từ 3 tag trùng trở lên (chính xác nhất)
-                                            P_global = [self._reference_map[cid]['p_local'] for cid in common_ids]
+                                            P_global = [ref_map_local[cid]['p_local'] for cid in common_ids]
                                             Q_local = [local_map[cid]['p_local'] for cid in common_ids]
                                             R_L2G, T_L2G = self._kabsch_alignment(np.array(Q_local), np.array(P_global))
                                         else:
                                             # Dùng 1 hoặc 2 tag trùng lặp (Dựa vào thông tin Rotation của AprilTag)
                                             cid = common_ids[0]
-                                            p_g = np.array(self._reference_map[cid]['p_local'])
-                                            R_g = np.array(self._reference_map[cid]['r_local'])
+                                            p_g = np.array(ref_map_local[cid]['p_local'])
+                                            R_g = np.array(ref_map_local[cid]['r_local'])
                                             p_l = np.array(local_map[cid]['p_local'])
                                             R_l = np.array(local_map[cid]['r_local'])
                                             
@@ -1035,29 +1034,41 @@ class CameraWorker(QThread):
                                             
                                         # Biến đổi các tag MỚI từ Local sang Global và thêm vào Reference Map
                                         for tid, data in local_map.items():
-                                            if tid not in self._reference_map:
+                                            if tid not in ref_map_local:
                                                 p_l_new = np.array(data['p_local'])
                                                 R_l_new = np.array(data['r_local'])
                                                 
                                                 p_g_new = R_L2G @ p_l_new + T_L2G
                                                 R_g_new = R_L2G @ R_l_new
                                                 
-                                                self._reference_map[tid] = {
+                                                ref_map_local[tid] = {
                                                     'p_local': p_g_new.tolist(),
                                                     'r_local': R_g_new.tolist()
                                                 }
+                                        calib_anchor_id = getattr(self, '_calibration_anchor_id', None)
+                                        if calib_anchor_id is None:
+                                            calib_anchor_id = temp_anchor
                                     else:
                                         self.status_msg.emit("Không tìm thấy tag trùng lặp! Không thể nối bản đồ.")
                                         self._calibration_active = False
                                         continue
-
+                                
+                                # Cập nhật ngược lại vào biến thành viên dưới sự bảo vệ của Mutex
+                                with QMutexLocker(self._mutex):
+                                    self._reference_map = copy.deepcopy(ref_map_local)
+                                    self._calibration_anchor_id = calib_anchor_id
+                                    # Cập nhật cả biến cục bộ reference_map để dùng ngay trong vòng này
+                                    reference_map = copy.deepcopy(ref_map_local)
+ 
                                 calibration_result = {
-                                    'anchor_id': int(self._calibration_anchor_id) if getattr(self, '_calibration_anchor_id', None) else int(temp_anchor),
-                                    'map': self._reference_map
+                                    'anchor_id': int(calib_anchor_id),
+                                    'map': ref_map_local,
+                                    'last_local_map': local_map,
+                                    'last_local_anchor': temp_anchor
                                 }
                                 self.calibration_complete.emit(calibration_result)
                                 self._calibration_active = False
-                                self.status_msg.emit(f"Cập nhật thành công! Tổng cộng {len(self._reference_map)} Tag trong bản đồ.")
+                                self.status_msg.emit(f"Cập nhật thành công! Tổng cộng {len(ref_map_local)} Tag trong bản đồ.")
                 
                 # 2. Reference Map Optimization & Virtual Tag Reconstruction (Handheld Mode with IMU complementary filter)
                 if use_ref_map and reference_map is not None:
@@ -1919,6 +1930,9 @@ class GroundTruthApp(QMainWindow):
         # Depth hovering data
         self.current_depth_matrix = None
         
+        # Map calibration history for global optimization
+        self.calibration_history = []
+        
         self.init_ui()
         self.apply_stylesheet()
         
@@ -2061,15 +2075,21 @@ class GroundTruthApp(QMainWindow):
         self.btn_calibrate_map.clicked.connect(self.start_map_calibration)
         stream_grid.addWidget(self.btn_calibrate_map, 7, 0, 1, 2)
 
+        self.btn_optimize_map = QPushButton("Tối ưu hóa bản đồ (Global)")
+        self.btn_optimize_map.setObjectName("btn_normal")
+        self.btn_optimize_map.setEnabled(False)
+        self.btn_optimize_map.clicked.connect(self.optimize_map_global)
+        stream_grid.addWidget(self.btn_optimize_map, 8, 0, 1, 2)
+
         self.btn_save_map = QPushButton("Lưu file (Save)")
         self.btn_save_map.setObjectName("btn_normal")
         self.btn_save_map.clicked.connect(self.save_map_file)
-        stream_grid.addWidget(self.btn_save_map, 8, 0, 1, 1)
+        stream_grid.addWidget(self.btn_save_map, 9, 0, 1, 1)
         
         self.btn_load_map = QPushButton("Tải file (Load)")
         self.btn_load_map.setObjectName("btn_normal")
         self.btn_load_map.clicked.connect(self.load_map_file)
-        stream_grid.addWidget(self.btn_load_map, 8, 1, 1, 1)
+        stream_grid.addWidget(self.btn_load_map, 9, 1, 1, 1)
         
         right_layout.addWidget(stream_group)
         
@@ -2545,6 +2565,7 @@ class GroundTruthApp(QMainWindow):
         self.btn_scan.setEnabled(False)
         self.settings_dialog.sb_source_id.setEnabled(False)
         self.btn_calibrate_map.setEnabled(True)
+        self.btn_reset_map.setEnabled(True)
         
         # Reset FPS calculation variables
         self.fps_timer = time.time()
@@ -2576,6 +2597,7 @@ class GroundTruthApp(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.settings_dialog.sb_source_id.setEnabled(True)
         self.btn_calibrate_map.setEnabled(False)
+        self.btn_reset_map.setEnabled(False)
         
         # Reset FPS
         self.fps_lbl.setText("FPS: N/A")
@@ -2583,6 +2605,8 @@ class GroundTruthApp(QMainWindow):
         
     def reset_map_calibration(self):
         self.worker.start_calibration(reset=True)
+        self.calibration_history = []
+        self.btn_optimize_map.setEnabled(False)
         self.status_bar_lbl.setText("Đã xóa bản đồ cũ trong bộ nhớ. Vui lòng nhấn 'Quét & Nối Tag' để bắt đầu tạo mốc mới.")
         
     def start_map_calibration(self):
@@ -2632,6 +2656,8 @@ class GroundTruthApp(QMainWindow):
                         
                     self.reference_map = ref_data.get('map')
                     self.reference_anchor_id = ref_data.get('anchor_id')
+                    self.calibration_history = []
+                    self.btn_optimize_map.setEnabled(False)
                     
                 self.chk_use_ref_map.setEnabled(True)
                 self.chk_use_ref_map.setChecked(True)
@@ -2645,6 +2671,13 @@ class GroundTruthApp(QMainWindow):
     def on_calibration_complete(self, result):
         self.reference_map = result['map']
         self.reference_anchor_id = result['anchor_id']
+        
+        if 'last_local_map' in result:
+            self.calibration_history.append({
+                'local_anchor': result['last_local_anchor'],
+                'local_map': result['last_local_map']
+            })
+            self.btn_optimize_map.setEnabled(True)
         
         # Đổi cơ chế lưu tự động: Luôn đính kèm thời gian (Timestamp) để chống mất dữ liệu do nhấn nhầm
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2810,8 +2843,9 @@ class GroundTruthApp(QMainWindow):
                     new_h = orig_h * scale
                     dx = (widget_w - new_w) / 2.0
                     dy = (widget_h - new_h) / 2.0
-                    x_widget = event.pos().x()
-                    y_widget = event.pos().y()
+                    pos = event.position()
+                    x_widget = pos.x()
+                    y_widget = pos.y()
                     x_image = x_widget - dx
                     y_image = y_widget - dy
                     if 0 <= x_image < new_w and 0 <= y_image < new_h:
@@ -2831,6 +2865,88 @@ class GroundTruthApp(QMainWindow):
             else:
                 QToolTip.hideText()
         return super().eventFilter(watched, event)
+
+    def optimize_map_global(self):
+        import numpy as np
+        if not self.calibration_history or not self.reference_map:
+            QMessageBox.warning(self, "Tối ưu hóa bản đồ", "Không có lịch sử quét để thực hiện tối ưu hóa!")
+            return
+            
+        all_tags = sorted(list(set(int(tid) for tid in self.reference_map.keys())))
+        if len(all_tags) <= 1:
+            QMessageBox.information(self, "Tối ưu hóa bản đồ", "Số lượng tag quá ít (<= 1), không cần tối ưu hóa.")
+            return
+            
+        global_anchor_id = self.reference_anchor_id
+        if global_anchor_id not in all_tags:
+            global_anchor_id = all_tags[0]
+            
+        variable_tags = [tid for tid in all_tags if tid != global_anchor_id]
+        tag_to_idx = {tid: i for i, tid in enumerate(variable_tags)}
+        num_vars = len(variable_tags)
+        
+        A_rows = []
+        B_rows = []
+        
+        for hist in self.calibration_history:
+            local_anchor = hist['local_anchor']
+            local_map = hist['local_map']
+            
+            local_anchor_str = str(local_anchor)
+            if local_anchor_str not in self.reference_map:
+                continue
+                
+            R_anchor_global = np.array(self.reference_map[local_anchor_str]['r_local'])
+            
+            for tid_str, data in local_map.items():
+                tid = int(tid_str)
+                if tid == local_anchor:
+                    continue
+                    
+                p_rel = np.array(data['p_local'])
+                d_val = R_anchor_global @ p_rel
+                
+                for dim in range(3):
+                    row_coeffs = [0.0] * (num_vars * 3)
+                    
+                    if tid != global_anchor_id:
+                        idx_tid = tag_to_idx[tid]
+                        row_coeffs[idx_tid * 3 + dim] = 1.0
+                        
+                    if local_anchor != global_anchor_id:
+                        idx_anchor = tag_to_idx[local_anchor]
+                        row_coeffs[idx_anchor * 3 + dim] = -1.0
+                        
+                    A_rows.append(row_coeffs)
+                    B_rows.append(d_val[dim])
+                    
+        if len(A_rows) == 0:
+            QMessageBox.warning(self, "Tối ưu hóa bản đồ", "Không lập được hệ phương trình ràng buộc!")
+            return
+            
+        A = np.array(A_rows, dtype=np.float32)
+        B = np.array(B_rows, dtype=np.float32)
+        
+        try:
+            X, residuals, rank, s = np.linalg.lstsq(A, B, rcond=None)
+            
+            self.reference_map[str(global_anchor_id)]['p_local'] = [0.0, 0.0, 0.0]
+            
+            for tid in variable_tags:
+                idx = tag_to_idx[tid]
+                p_opt = X[idx * 3 : idx * 3 + 3].tolist()
+                self.reference_map[str(tid)]['p_local'] = p_opt
+                
+            self.push_config_to_worker()
+            
+            mse = float(np.mean(residuals)) if len(residuals) > 0 else 0.0
+            QMessageBox.information(self, "Tối ưu hóa bản đồ", 
+                                    f"Tối ưu hóa toàn cục thành công!\n"
+                                    f"Đã giải hệ phương trình với {len(A_rows)//3} ràng buộc liên kết.\n"
+                                    f"Sai số bình phương trung bình (MSE): {mse:.6f} m^2.")
+            self.status_bar_lbl.setText("Đã tối ưu hóa toàn cục hệ tọa độ bản đồ tham chiếu.")
+        except Exception as e:
+            QMessageBox.critical(self, "Tối ưu hóa bản đồ", f"Lỗi trong quá trình tối ưu hóa: {str(e)}")
 
     @Slot(str)
     def handle_camera_error(self, error_msg):
