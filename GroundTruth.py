@@ -2035,61 +2035,61 @@ class GroundTruthApp(QMainWindow):
         self.btn_scan = QPushButton("Quét Thiết Bị (Scan)")
         self.btn_scan.setObjectName("btn_normal")
         self.btn_scan.clicked.connect(self.scan_devices)
-        stream_grid.addWidget(self.btn_scan, 1, 0, 1, 2)
+        stream_grid.addWidget(self.btn_scan, 1, 0, 1, 1)
         
         self.btn_toggle_stream = QPushButton("Run")
         self.btn_toggle_stream.setObjectName("btn_start")
         self.btn_toggle_stream.clicked.connect(self.toggle_camera_stream)
-        stream_grid.addWidget(self.btn_toggle_stream, 2, 0, 1, 2)
+        stream_grid.addWidget(self.btn_toggle_stream, 1, 1, 1, 1)
         
         # Checkbox to toggle depth view
         self.chk_show_depth = QCheckBox("Hiển thị camera Depth chiều sâu")
         self.chk_show_depth.setChecked(False)
         self.chk_show_depth.stateChanged.connect(self.toggle_depth_visibility)
-        stream_grid.addWidget(self.chk_show_depth, 3, 0, 1, 2)
+        stream_grid.addWidget(self.chk_show_depth, 2, 0, 1, 2)
         
         # Checkbox for using reference map
         self.chk_use_ref_map = QCheckBox("Sử dụng bản đồ tham chiếu (Giảm nhiễu)")
         self.chk_use_ref_map.setChecked(False)
         self.chk_use_ref_map.setEnabled(False)
         self.chk_use_ref_map.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_use_ref_map, 4, 0, 1, 2)
+        stream_grid.addWidget(self.chk_use_ref_map, 3, 0, 1, 2)
         
         # Checkbox for using IMU fusion
         self.chk_use_imu = QCheckBox("Sử dụng cảm biến IMU (D455)")
         self.chk_use_imu.setChecked(True)
         self.chk_use_imu.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_use_imu, 5, 0, 1, 2)
+        stream_grid.addWidget(self.chk_use_imu, 4, 0, 1, 2)
         
         # Button to reset/start new map
-        self.btn_reset_map = QPushButton("Tạo bản đồ mới (Xóa dữ liệu cũ)")
+        self.btn_reset_map = QPushButton("Tạo bản đồ mới")
         self.btn_reset_map.setObjectName("btn_stop")
         self.btn_reset_map.setEnabled(False)
         self.btn_reset_map.clicked.connect(self.reset_map_calibration)
-        stream_grid.addWidget(self.btn_reset_map, 6, 0, 1, 2)
+        stream_grid.addWidget(self.btn_reset_map, 5, 0, 1, 1)
         
         # Button to append to map (Cuốn chiếu)
-        self.btn_calibrate_map = QPushButton("Quét & Nối Tag (Cuốn chiếu)")
+        self.btn_calibrate_map = QPushButton("Quét & Nối Tag")
         self.btn_calibrate_map.setObjectName("btn_normal")
         self.btn_calibrate_map.setEnabled(False)
         self.btn_calibrate_map.clicked.connect(self.start_map_calibration)
-        stream_grid.addWidget(self.btn_calibrate_map, 7, 0, 1, 2)
+        stream_grid.addWidget(self.btn_calibrate_map, 5, 1, 1, 1)
 
         self.btn_optimize_map = QPushButton("Tối ưu hóa bản đồ (Global)")
         self.btn_optimize_map.setObjectName("btn_normal")
         self.btn_optimize_map.setEnabled(False)
         self.btn_optimize_map.clicked.connect(self.optimize_map_global)
-        stream_grid.addWidget(self.btn_optimize_map, 8, 0, 1, 2)
+        stream_grid.addWidget(self.btn_optimize_map, 6, 0, 1, 2)
 
         self.btn_save_map = QPushButton("Lưu file (Save)")
         self.btn_save_map.setObjectName("btn_normal")
         self.btn_save_map.clicked.connect(self.save_map_file)
-        stream_grid.addWidget(self.btn_save_map, 9, 0, 1, 1)
+        stream_grid.addWidget(self.btn_save_map, 7, 0, 1, 1)
         
         self.btn_load_map = QPushButton("Tải file (Load)")
         self.btn_load_map.setObjectName("btn_normal")
         self.btn_load_map.clicked.connect(self.load_map_file)
-        stream_grid.addWidget(self.btn_load_map, 9, 1, 1, 1)
+        stream_grid.addWidget(self.btn_load_map, 7, 1, 1, 1)
         
         right_layout.addWidget(stream_group)
         
