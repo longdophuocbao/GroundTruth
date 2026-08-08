@@ -33,6 +33,10 @@ class BaseCameraDevice:
         """
         raise NotImplementedError
 
+    def get_colorized_depth(self, depth_frame):
+        """Trả về hình ảnh màu chiều sâu để hiển thị GUI."""
+        raise NotImplementedError
+
 class RealSenseCameraDevice(BaseCameraDevice):
     def __init__(self):
         self.pipeline = None
@@ -172,6 +176,12 @@ class RealSenseCameraDevice(BaseCameraDevice):
         except Exception:
             return False, None, None, None, None
 
+    def get_colorized_depth(self, depth_frame):
+        if depth_frame is not None:
+            colorized_depth = self.colorizer.colorize(depth_frame)
+            return np.asanyarray(colorized_depth.get_data()).copy()
+        return None
+
 class ZED2iUVCCameraDevice(BaseCameraDevice):
     def __init__(self, camera_index=0):
         self.camera_index = camera_index
@@ -242,6 +252,121 @@ class ZED2iUVCCameraDevice(BaseCameraDevice):
         }
         
         return True, color_image, depth_frame, gyro_data, self.intrinsics_dict
+
+    def get_colorized_depth(self, depth_frame):
+        return None
+
+class ZED2iSDKCameraDevice(BaseCameraDevice):
+    def __init__(self):
+        self.zed = None
+        self.init_params = None
+        self.runtime_params = None
+        self.image = None
+        self.depth = None
+        self.sensors_data = None
+        
+    def open(self):
+        try:
+            import pyzed.sl as sl
+        except ImportError:
+            return False, (
+                "Không tìm thấy thư viện 'pyzed'.\n\n"
+                "Để sử dụng chế độ ZED SDK (CUDA):\n"
+                "1. Tải và cài đặt ZED SDK từ website của Stereolabs.\n"
+                "2. Chạy script 'get_python_api.py' trong thư mục cài đặt ZED SDK để cài đặt wrapper 'pyzed'.\n"
+                "3. Đảm bảo máy tính đã cài đặt driver NVIDIA và CUDA Toolkit phù hợp với card GTX 1650."
+            )
+            
+        self.zed = sl.Camera()
+        self.init_params = sl.InitParameters()
+        self.init_params.camera_resolution = sl.RESOLUTION.HD720
+        self.init_params.camera_fps = 30
+        self.init_params.depth_mode = sl.DEPTH_MODE.ULTRA  # GPU CUDA accelerated depth matching
+        self.init_params.coordinate_units = sl.UNIT.METER
+        self.runtime_params = sl.RuntimeParameters()
+        
+        self.image = sl.Mat()
+        self.depth = sl.Mat()
+        self.sensors_data = sl.SensorsData()
+        
+        err = self.zed.open(self.init_params)
+        if err != sl.ERROR_CODE.SUCCESS:
+            return False, f"Không thể kết nối ZED Camera qua SDK: {err}"
+            
+        return True, "Khởi động ZED 2i SDK (CUDA) thành công."
+        
+    def close(self):
+        if self.zed:
+            try:
+                self.zed.close()
+            except Exception:
+                pass
+            self.zed = None
+            
+    def get_frames(self, laser_power=150, filters_config=None):
+        import pyzed.sl as sl
+        if not self.zed or not self.zed.is_opened():
+            return False, None, None, None, None
+            
+        if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
+            # 1. Get Left Image
+            self.zed.retrieve_image(self.image, sl.VIEW.LEFT)
+            bgra_image = self.image.get_data()
+            color_image = cv2.cvtColor(bgra_image, cv2.COLOR_BGRA2BGR)
+            
+            # 2. Get Depth Map
+            self.zed.retrieve_measure(self.depth, sl.MEASURE.DEPTH)
+            depth_data = self.depth.get_data()  # float32 matrix in meters
+            
+            # Dummy class to mimic RealSense depth frame
+            class ZEDDepthFrameDummy:
+                def __init__(self, depth_matrix):
+                    self.depth_matrix = depth_matrix
+                    self.h, self.w = depth_matrix.shape[:2]
+                def get_width(self):
+                    return self.w
+                def get_height(self):
+                    return self.h
+                def get_distance(self, u, v):
+                    if 0 <= u < self.w and 0 <= v < self.h:
+                        val = self.depth_matrix[v, u]
+                        if np.isnan(val) or np.isinf(val):
+                            return 0.0
+                        return float(val)
+                    return 0.0
+            
+            depth_frame = ZEDDepthFrameDummy(depth_data)
+            
+            # 3. Get IMU gyro data
+            gyro_data = None
+            if self.zed.get_sensors_data(self.sensors_data, sl.TIME_REFERENCE.IMAGE) == sl.ERROR_CODE.SUCCESS:
+                imu = self.sensors_data.get_imu_data()
+                gyro = imu.get_angular_velocity()
+                gyro_data = [gyro[0], gyro[1], gyro[2]]
+                
+            # 4. Get Intrinsics
+            calib = self.zed.get_camera_information().camera_configuration.calibration_parameters.left_cam
+            intrinsics_dict = {
+                'fx': float(calib.fx),
+                'fy': float(calib.fy),
+                'ppx': float(calib.cx),
+                'ppy': float(calib.cy),
+                'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
+            }
+            
+            return True, color_image, depth_frame, gyro_data, intrinsics_dict
+            
+        return False, None, None, None, None
+
+    def get_colorized_depth(self, depth_frame):
+        # Generate custom colored depth map for display on GUI
+        depth_matrix = depth_frame.depth_matrix.copy()
+        depth_matrix[np.isnan(depth_matrix) | np.isinf(depth_matrix)] = 0.0
+        max_dist = 5.0
+        depth_scaled = np.clip(depth_matrix / max_dist * 255.0, 0, 255).astype(np.uint8)
+        color_depth = cv2.applyColorMap(depth_scaled, cv2.COLORMAP_JET)
+        color_depth[depth_matrix == 0.0] = 0
+        return color_depth
 
 class TagTracker:
     def __init__(self, tag_id, alpha=0.7, max_lost_frames=15):
@@ -439,6 +564,9 @@ class CameraWorker(QThread):
         if camera_type == "realsense":
             self.status_msg.emit("Đang khởi tạo camera RealSense...")
             camera = RealSenseCameraDevice()
+        elif camera_type == "zed_sdk":
+            self.status_msg.emit("Đang khởi tạo camera ZED 2i (ZED SDK CUDA Mode)...")
+            camera = ZED2iSDKCameraDevice()
         else:
             self.status_msg.emit("Đang khởi tạo camera ZED 2i (UVC Mode)...")
             camera = ZED2iUVCCameraDevice(camera_index=0)
@@ -1002,10 +1130,9 @@ class CameraWorker(QThread):
                     self._write_log_row(results, source_id, source_pos, target_ids)
                 
                 # Generate colorized depth image to send to GUI
-                if depth_frame is not None and hasattr(camera, 'colorizer'):
+                if depth_frame is not None:
                     try:
-                        colorized_depth = camera.colorizer.colorize(depth_frame)
-                        depth_image = np.asanyarray(colorized_depth.get_data()).copy()
+                        depth_image = camera.get_colorized_depth(depth_frame)
                     except Exception:
                         depth_image = None
                 else:
@@ -1586,7 +1713,7 @@ class GroundTruthApp(QMainWindow):
         
         self.lbl_camera_source = QLabel("Chọn Camera:")
         self.cmb_camera_source = QComboBox()
-        self.cmb_camera_source.addItems(["Intel RealSense D455", "ZED 2i (UVC Mode)"])
+        self.cmb_camera_source.addItems(["Intel RealSense D455", "ZED 2i (UVC Mode)", "ZED 2i (ZED SDK CUDA Mode)"])
         self.cmb_camera_source.currentIndexChanged.connect(self.on_camera_source_changed)
         stream_grid.addWidget(self.lbl_camera_source, 0, 0, 1, 1)
         stream_grid.addWidget(self.cmb_camera_source, 0, 1, 1, 1)
@@ -1888,24 +2015,41 @@ class GroundTruthApp(QMainWindow):
         reference_map = self.reference_map
         use_imu = self.chk_use_imu.isChecked()
         
-        camera_type = "zed_uvc" if self.cmb_camera_source.currentIndex() == 1 else "realsense"
-        
+        idx = self.cmb_camera_source.currentIndex()
+        if idx == 1:
+            camera_type = "zed_uvc"
+        elif idx == 2:
+            camera_type = "zed_sdk"
+        else:
+            camera_type = "realsense"
+            
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                                   enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
                                   threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type)
         
     def on_camera_source_changed(self, index):
-        camera_type = "zed_uvc" if index == 1 else "realsense"
+        if index == 1:
+            camera_type = "zed_uvc"
+        elif index == 2:
+            camera_type = "zed_sdk"
+        else:
+            camera_type = "realsense"
+            
         if camera_type == "zed_uvc":
             self.chk_use_imu.setChecked(False)
             self.chk_use_imu.setEnabled(False)
             self.chk_show_depth.setChecked(False)
             self.chk_show_depth.setEnabled(False)
             self.status_bar_lbl.setText("Đã chuyển sang ZED 2i (UVC Mode). Khuyên dùng chế độ đo PnP.")
-            
-            # Tự động chuyển mode trong settings sang PnP
             self.settings_dialog.cb_coord_mode.setCurrentIndex(1) # pnp mode
+        elif camera_type == "zed_sdk":
+            self.chk_use_imu.setEnabled(True)
+            self.chk_use_imu.setChecked(True)
+            self.chk_show_depth.setEnabled(True)
+            self.chk_show_depth.setChecked(True)
+            self.status_bar_lbl.setText("Đã chuyển sang ZED 2i (ZED SDK CUDA Mode). Sử dụng GPU tính toán chiều sâu.")
+            self.settings_dialog.cb_coord_mode.setCurrentIndex(0) # depth mode
         else:
             self.chk_use_imu.setEnabled(True)
             self.chk_use_imu.setChecked(True)
@@ -1917,7 +2061,13 @@ class GroundTruthApp(QMainWindow):
         self.status_bar_lbl.setText("Đang quét thiết bị camera...")
         QApplication.processEvents()
         
-        camera_type = "zed_uvc" if self.cmb_camera_source.currentIndex() == 1 else "realsense"
+        idx = self.cmb_camera_source.currentIndex()
+        if idx == 1:
+            camera_type = "zed_uvc"
+        elif idx == 2:
+            camera_type = "zed_sdk"
+        else:
+            camera_type = "realsense"
         
         if camera_type == "realsense":
             try:
@@ -1942,6 +2092,32 @@ class GroundTruthApp(QMainWindow):
             except Exception as e:
                 self.status_bar_lbl.setText("Lỗi khi quét thiết bị.")
                 QMessageBox.critical(self, "Lỗi Quét Thiết Bị", f"Lỗi xảy ra trong quá trình quét: {str(e)}")
+        elif camera_type == "zed_sdk":
+            self.status_bar_lbl.setText("Đang kiểm tra kết nối ZED SDK...")
+            QApplication.processEvents()
+            try:
+                import pyzed.sl as sl
+                zed = sl.Camera()
+                init = sl.InitParameters()
+                err = zed.open(init)
+                if err == sl.ERROR_CODE.SUCCESS:
+                    info = zed.get_camera_information()
+                    name = info.camera_model
+                    sn = info.serial_number
+                    zed.close()
+                    self.status_bar_lbl.setText(f"Tìm thấy camera ZED qua SDK (S/N: {sn})")
+                    QMessageBox.information(self, "Quét Thiết Bị", f"Đã phát hiện camera ZED: {name} (S/N: {sn}) qua SDK (CUDA).")
+                else:
+                    self.status_bar_lbl.setText(f"Không thể mở ZED SDK: {err}")
+                    QMessageBox.warning(self, "Quét Thiết Bị", f"Không thể mở ZED Camera qua SDK. Mã lỗi: {err}")
+            except ImportError:
+                self.status_bar_lbl.setText("Lỗi: Thiếu thư viện pyzed.")
+                QMessageBox.critical(self, "Lỗi Quét Thiết Bị", 
+                                     "Chưa cài đặt thư viện 'pyzed' Python wrapper.\n\n"
+                                     "Vui lòng tải và cài đặt ZED SDK từ trang chủ Stereolabs để sử dụng GPU CUDA.")
+            except Exception as e:
+                self.status_bar_lbl.setText("Lỗi kết nối ZED SDK.")
+                QMessageBox.critical(self, "Lỗi Quét Thiết Bị", f"Lỗi xảy ra: {str(e)}")
         else:
             try:
                 # Quét thử ZED UVC trên các cổng video
@@ -1955,7 +2131,6 @@ class GroundTruthApp(QMainWindow):
                         w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
                         h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
                         cap.release()
-                        # ZED 2i ở chế độ UVC thường có độ phân giải side-by-side 1344x376
                         if w == 1344 and h == 376 or (w > 0 and w == h * 2 * 1.78):
                             zed_found = True
                             zed_index = index
@@ -1993,7 +2168,13 @@ class GroundTruthApp(QMainWindow):
             self.start_camera_stream()
 
     def start_camera_stream(self):
-        camera_type = "zed_uvc" if self.cmb_camera_source.currentIndex() == 1 else "realsense"
+        idx = self.cmb_camera_source.currentIndex()
+        if idx == 1:
+            camera_type = "zed_uvc"
+        elif idx == 2:
+            camera_type = "zed_sdk"
+        else:
+            camera_type = "realsense"
         
         if camera_type == "realsense":
             try:
@@ -2006,6 +2187,14 @@ class GroundTruthApp(QMainWindow):
                     return
             except Exception as e:
                 QMessageBox.critical(self, "Lỗi kiểm tra camera", f"Có lỗi xảy ra khi kiểm tra camera: {str(e)}")
+                return
+        elif camera_type == "zed_sdk":
+            try:
+                import pyzed.sl as sl
+            except ImportError:
+                QMessageBox.critical(self, "Lỗi kết nối camera", 
+                                     "Chưa cài đặt thư viện 'pyzed' Python wrapper.\n\n"
+                                     "Vui lòng tải và cài đặt ZED SDK từ website của Stereolabs để sử dụng GPU CUDA trên card GTX 1650.")
                 return
         else:
             # Kiểm tra xem ZED 2i UVC có mở được không
