@@ -197,6 +197,10 @@ class ZED2iUVCCameraDevice(BaseCameraDevice):
         if not self.cap.isOpened():
             return False, f"Không thể kết nối camera ZED 2i tại index {self.camera_index}"
             
+        # Thiết lập độ phân giải 2560x720 (Side-by-Side)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 2560)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        
         ret, frame = self.cap.read()
         if not ret or frame is None:
             self.cap.release()
@@ -218,7 +222,7 @@ class ZED2iUVCCameraDevice(BaseCameraDevice):
             'ppy': float(h / 2.0),
             'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
         }
-        return True, "Khởi động ZED 2i (UVC) thành công."
+        return True, f"Khởi động ZED 2i (UVC) thành công với độ phân giải {w}x{h} (mỗi mắt {w_eye}x{h})."
         
     def close(self):
         if self.cap:
