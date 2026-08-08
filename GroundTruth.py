@@ -79,7 +79,7 @@ DEFAULT_ENABLE_SMOOTHING = False  # Kích hoạt bộ lọc mượt 3D (EMA) m�
 DEFAULT_FILTER_ALPHA = 0.70       # Độ phản hồi bộ lọc EMA mặc định (0.01 - 1.0)
 DEFAULT_ENABLE_KEEP_ALIVE = False # Duy trì trạng thái khi mất dấu mặc định
 DEFAULT_MAX_LOST_FRAMES = 15      # Khung hình duy trì tối đa khi mất dấu
-DEFAULT_FILTER_WINDOW_SIZE = 10   # Độ dài bộ lọc trung bình trượt mặc định (khung hình)
+DEFAULT_FILTER_WINDOW_SIZE = 3   # Độ dài bộ lọc trung bình trượt mặc định (khung hình)
 
 # Tham số bộ lọc RealSense Post-Processing
 DEFAULT_RS_DECIMATION = False     # Lọc Decimation (giảm độ phân giải) mặc định
@@ -87,23 +87,23 @@ DEFAULT_RS_HOLE_FILLING = True    # Lọc Hole Filling (vá lỗ thủng) mặc 
 DEFAULT_RS_SPATIAL = True         # Lọc Spatial (làm mịn không gian) mặc định
 DEFAULT_RS_TEMPORAL = True        # Lọc Temporal (làm mịn theo thời gian) mặc định
 DEFAULT_RS_THRESHOLD = True       # Lọc Threshold (bộ lọc ngưỡng) mặc định
-DEFAULT_RS_THRESHOLD_MIN = 1.0    # Ngưỡng khoảng cách tối thiểu RealSense (mét)
+DEFAULT_RS_THRESHOLD_MIN = 0.5    # Ngưỡng khoảng cách tối thiểu RealSense (mét)
 DEFAULT_RS_THRESHOLD_MAX = 4.0    # Ngưỡng khoảng cách tối đa RealSense (mét)
 DEFAULT_RS_LASER_POWER = 150      # Công suất phát Laser RealSense mặc định (mW)
 
 # Tham số ZED SDK (CUDA) mặc định
-DEFAULT_ZED_RESOLUTION = "HD720"      # Độ phân giải ZED: "HD2K", "HD1080", "HD720", "VGA"
+DEFAULT_ZED_RESOLUTION = "HD2K"      # Độ phân giải ZED: "HD2K", "HD1080", "HD720", "VGA"
 DEFAULT_ZED_DEPTH_MODE = "NEURAL_PLUS" # Chế độ depth: "NEURAL_PLUS", "NEURAL", "NEURAL_LIGHT", "ULTRA", etc.
 DEFAULT_ZED_SENSING_MODE = "FILL"     # Chế độ cảm nhận: "STANDARD" hoặc "FILL"
 DEFAULT_ZED_CONFIDENCE = 95           # Ngưỡng tin cậy độ sâu ZED (1 - 100)
 DEFAULT_ZED_TEXTURE_CONFIDENCE = 100  # Ngưỡng vân bề mặt ZED (1 - 100)
-DEFAULT_ZED_DEPTH_MIN = 0.4           # Khoảng cách depth ZED tối thiểu (mét)
+DEFAULT_ZED_DEPTH_MIN = 0.5           # Khoảng cách depth ZED tối thiểu (mét)
 DEFAULT_ZED_DEPTH_MAX = 20.0          # Khoảng cách depth ZED tối đa (mét)
 
 # Tham số IMU và Hiệu ứng vẽ vệt di chuyển
 DEFAULT_USE_IMU = False           # Sử dụng cảm biến IMU mặc định
-DEFAULT_DRAW_TRAIL = False        # Vẽ vệt di chuyển của Tag 1 mặc định
-TRAIL_DECAY_RATE = 0.04           # Tốc độ mờ vệt di chuyển mỗi khung hình
+DEFAULT_DRAW_TRAIL = True        # Vẽ vệt di chuyển của Tag 1 mặc định
+TRAIL_DECAY_RATE = 0.02           # Tốc độ mờ vệt di chuyển mỗi khung hình
 TRAIL_COLOR_BGR = (0, 140, 255)   # Màu sắc vệt di chuyển (BGR, mặc định là màu cam)
 # ==============================================================================
 
@@ -2279,7 +2279,35 @@ class GroundTruthApp(QMainWindow):
             self.chk_use_ref_map.setChecked(True)
 
     def show_settings_dialog(self):
+        # Lưu lại cấu hình phần cứng trước khi thay đổi
+        old_res = self.settings_dialog.cb_zed_resolution.currentData()
+        old_mode = self.settings_dialog.cb_zed_depth_mode.currentData()
+        
         self.settings_dialog.exec()
+        
+        # Đọc cấu hình phần cứng sau khi đóng dialog
+        new_res = self.settings_dialog.cb_zed_resolution.currentData()
+        new_mode = self.settings_dialog.cb_zed_depth_mode.currentData()
+        
+        # Nếu camera đang chạy và người dùng thay đổi cấu hình phần cứng ZED (Độ phân giải hoặc Depth Mode)
+        if self.worker.isRunning() and (old_res != new_res or old_mode != new_mode):
+            reply = QMessageBox.question(
+                self, 
+                "Áp dụng cấu hình ZED",
+                "Bạn đã thay đổi cấu hình phần cứng ZED Camera (Độ phân giải hoặc Depth Mode).\n\n"
+                "Các thay đổi này bắt buộc phải khởi động lại luồng camera mới có hiệu lực.\n"
+                "Bạn có muốn khởi động lại camera ngay bây giờ không?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self.status_bar_lbl.setText("Đang khởi động lại camera để áp dụng cấu hình mới...")
+                self.stop_camera_stream()
+                # Khởi động lại sau 800ms để đảm bảo luồng camera cũ đã đóng hoàn toàn và giải phóng tài nguyên CUDA
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(800, self.start_camera_stream)
+            else:
+                self.status_bar_lbl.setText("Cấu hình ZED mới sẽ được áp dụng trong lần nhấn 'Run' tiếp theo.")
         
     def apply_stylesheet(self):
         qss = """
