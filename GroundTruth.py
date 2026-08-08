@@ -66,6 +66,47 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                              QDoubleSpinBox, QSpinBox, QDialog, QToolTip)
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QIcon, QCursor
 
+# ==============================================================================
+# BẢNG THAM SỐ CẤU HÌNH HỆ THỐNG MẶC ĐỊNH (SYSTEM DEFAULT CONFIGURATIONS)
+# Người dùng có thể tự do thay đổi các giá trị mặc định này tại đây.
+# ==============================================================================
+DEFAULT_TAG_SIZE_MM = 150.0       # Kích thước AprilTag mặc định (mm)
+DEFAULT_SOURCE_TAG_ID = 1         # ID AprilTag nguồn mặc định
+DEFAULT_TARGET_TAG_IDS_STR = ""   # Danh sách ID mục tiêu mặc định (ngăn cách bằng dấu phẩy, ví dụ "2,3,4")
+DEFAULT_COORD_MODE = "depth"      # Thuật toán tọa độ 3D mặc định ("depth" hoặc "pnp")
+
+DEFAULT_ENABLE_SMOOTHING = False  # Kích hoạt bộ lọc mượt 3D (EMA) mặc định
+DEFAULT_FILTER_ALPHA = 0.70       # Độ phản hồi bộ lọc EMA mặc định (0.01 - 1.0)
+DEFAULT_ENABLE_KEEP_ALIVE = False # Duy trì trạng thái khi mất dấu mặc định
+DEFAULT_MAX_LOST_FRAMES = 15      # Khung hình duy trì tối đa khi mất dấu
+DEFAULT_FILTER_WINDOW_SIZE = 10   # Độ dài bộ lọc trung bình trượt mặc định (khung hình)
+
+# Tham số bộ lọc RealSense Post-Processing
+DEFAULT_RS_DECIMATION = False     # Lọc Decimation (giảm độ phân giải) mặc định
+DEFAULT_RS_HOLE_FILLING = True    # Lọc Hole Filling (vá lỗ thủng) mặc định
+DEFAULT_RS_SPATIAL = True         # Lọc Spatial (làm mịn không gian) mặc định
+DEFAULT_RS_TEMPORAL = True        # Lọc Temporal (làm mịn theo thời gian) mặc định
+DEFAULT_RS_THRESHOLD = True       # Lọc Threshold (bộ lọc ngưỡng) mặc định
+DEFAULT_RS_THRESHOLD_MIN = 1.0    # Ngưỡng khoảng cách tối thiểu RealSense (mét)
+DEFAULT_RS_THRESHOLD_MAX = 4.0    # Ngưỡng khoảng cách tối đa RealSense (mét)
+DEFAULT_RS_LASER_POWER = 150      # Công suất phát Laser RealSense mặc định (mW)
+
+# Tham số ZED SDK (CUDA) mặc định
+DEFAULT_ZED_RESOLUTION = "HD720"      # Độ phân giải ZED: "HD2K", "HD1080", "HD720", "VGA"
+DEFAULT_ZED_DEPTH_MODE = "NEURAL_PLUS" # Chế độ depth: "NEURAL_PLUS", "NEURAL", "NEURAL_LIGHT", "ULTRA", etc.
+DEFAULT_ZED_SENSING_MODE = "FILL"     # Chế độ cảm nhận: "STANDARD" hoặc "FILL"
+DEFAULT_ZED_CONFIDENCE = 95           # Ngưỡng tin cậy độ sâu ZED (1 - 100)
+DEFAULT_ZED_TEXTURE_CONFIDENCE = 100  # Ngưỡng vân bề mặt ZED (1 - 100)
+DEFAULT_ZED_DEPTH_MIN = 0.4           # Khoảng cách depth ZED tối thiểu (mét)
+DEFAULT_ZED_DEPTH_MAX = 20.0          # Khoảng cách depth ZED tối đa (mét)
+
+# Tham số IMU và Hiệu ứng vẽ vệt di chuyển
+DEFAULT_USE_IMU = False           # Sử dụng cảm biến IMU mặc định
+DEFAULT_DRAW_TRAIL = False        # Vẽ vệt di chuyển của Tag 1 mặc định
+TRAIL_DECAY_RATE = 0.04           # Tốc độ mờ vệt di chuyển mỗi khung hình
+TRAIL_COLOR_BGR = (0, 140, 255)   # Màu sắc vệt di chuyển (BGR, mặc định là màu cam)
+# ==============================================================================
+
 class BaseCameraDevice:
     def open(self):
         """Mở kết nối camera. Trả về (success, message)."""
@@ -609,20 +650,20 @@ class CameraWorker(QThread):
         
         # ZED SDK Config default parameters
         self._zed_config = {
-            'resolution': 'HD720',
-            'depth_mode': 'NEURAL_PLUS',
-            'sensing_mode': 'FILL',
-            'confidence': 95,
-            'texture_confidence': 100,
-            'depth_min': 0.4,
-            'depth_max': 20.0
+            'resolution': DEFAULT_ZED_RESOLUTION,
+            'depth_mode': DEFAULT_ZED_DEPTH_MODE,
+            'sensing_mode': DEFAULT_ZED_SENSING_MODE,
+            'confidence': DEFAULT_ZED_CONFIDENCE,
+            'texture_confidence': DEFAULT_ZED_TEXTURE_CONFIDENCE,
+            'depth_min': DEFAULT_ZED_DEPTH_MIN,
+            'depth_max': DEFAULT_ZED_DEPTH_MAX
         }
         
         # Reference Map state
         self._use_ref_map = False
         self._reference_map = None
-        self._use_imu = False
-        self._draw_trail = False
+        self._use_imu = DEFAULT_USE_IMU
+        self._draw_trail = DEFAULT_DRAW_TRAIL
         self._trail_points = []
         self._filtered_R_A = None
         self._filtered_P_A = None
@@ -636,7 +677,7 @@ class CameraWorker(QThread):
         
         self._trackers = {}
         self._distance_history = []
-        self._window_size = 10
+        self._window_size = DEFAULT_FILTER_WINDOW_SIZE
         
         # Logger state
         self._log_file_path = ""
@@ -1311,7 +1352,7 @@ class CameraWorker(QThread):
                     # Decay opacity of existing trail points and filter out invisible ones
                     active_trail = []
                     for pt in self._trail_points:
-                        pt[2] -= 0.04  # opacity decay rate per frame (~25 frames lifetime)
+                        pt[2] -= TRAIL_DECAY_RATE  # opacity decay rate per frame
                         if pt[2] > 0.0:
                             active_trail.append(pt)
                     self._trail_points = active_trail
@@ -1321,14 +1362,14 @@ class CameraWorker(QThread):
                         pt1 = (self._trail_points[k][0], self._trail_points[k][1])
                         pt2 = (self._trail_points[k+1][0], self._trail_points[k+1][1])
                         op = self._trail_points[k+1][2]
-                        # Orange trail (BGR: 0, 140, 255) with opacity factor
-                        color = (int(0 * op), int(140 * op), int(255 * op))
+                        # Apply opacity factor to BGR trail color
+                        color = (int(TRAIL_COLOR_BGR[0] * op), int(TRAIL_COLOR_BGR[1] * op), int(TRAIL_COLOR_BGR[2] * op))
                         cv2.line(color_image, pt1, pt2, color, 3, cv2.LINE_AA)
                         
                     # Draw circles on each trail point
                     for pt in self._trail_points:
                         x, y, op = pt[0], pt[1], pt[2]
-                        color = (int(0 * op), int(140 * op), int(255 * op))
+                        color = (int(TRAIL_COLOR_BGR[0] * op), int(TRAIL_COLOR_BGR[1] * op), int(TRAIL_COLOR_BGR[2] * op))
                         cv2.circle(color_image, (x, y), 4, color, -1, cv2.LINE_AA)
                 else:
                     self._trail_points.clear()
@@ -1638,20 +1679,21 @@ class SettingsDialog(QDialog):
         config_grid.addWidget(QLabel("Kích thước AprilTag (mm):"), 0, 0)
         self.sb_tag_size = QDoubleSpinBox()
         self.sb_tag_size.setRange(1.0, 1000.0)
-        self.sb_tag_size.setValue(150.0) # default 150mm
+        self.sb_tag_size.setValue(DEFAULT_TAG_SIZE_MM)
         self.sb_tag_size.setSuffix(" mm")
         config_grid.addWidget(self.sb_tag_size, 0, 1)
         
-        # Source tag ID (ID 1)
+        # Source tag ID
         config_grid.addWidget(QLabel("AprilTag ID Nguồn (Gốc):"), 1, 0)
         self.sb_source_id = QSpinBox()
         self.sb_source_id.setRange(0, 1000)
-        self.sb_source_id.setValue(1) # Default ID 1
+        self.sb_source_id.setValue(DEFAULT_SOURCE_TAG_ID)
         config_grid.addWidget(self.sb_source_id, 1, 1)
         
         # Target tag IDs
         config_grid.addWidget(QLabel("ID Đường Mục Tiêu (Ngăn cách bằng dấu phẩy):"), 2, 0)
         self.txt_target_ids = QLineEdit()
+        self.txt_target_ids.setText(DEFAULT_TARGET_TAG_IDS_STR)
         self.txt_target_ids.setPlaceholderText("Trống: Dùng tất cả tag khác")
         config_grid.addWidget(self.txt_target_ids, 2, 1)
         
@@ -1660,6 +1702,7 @@ class SettingsDialog(QDialog):
         self.cb_coord_mode = QComboBox()
         self.cb_coord_mode.addItem("Sử dụng Cảm biến Depth RealSense trực tiếp (Mặc định)", "depth")
         self.cb_coord_mode.addItem("Sử dụng SolvePnP hình học", "pnp")
+        self.cb_coord_mode.setCurrentIndex(0 if DEFAULT_COORD_MODE == "depth" else 1)
         config_grid.addWidget(self.cb_coord_mode, 3, 1)
         
         left_col.addWidget(config_group)
@@ -1669,30 +1712,30 @@ class SettingsDialog(QDialog):
         tracking_grid = QGridLayout(tracking_group)
         
         self.chk_enable_smoothing = QCheckBox("Kích hoạt bộ lọc mượt 3D (EMA)")
-        self.chk_enable_smoothing.setChecked(False)
+        self.chk_enable_smoothing.setChecked(DEFAULT_ENABLE_SMOOTHING)
         tracking_grid.addWidget(self.chk_enable_smoothing, 0, 0, 1, 2)
         
         tracking_grid.addWidget(QLabel("Độ phản hồi bộ lọc (Alpha):"), 1, 0)
         self.sb_filter_alpha = QDoubleSpinBox()
         self.sb_filter_alpha.setRange(0.01, 1.0)
-        self.sb_filter_alpha.setValue(0.70)
+        self.sb_filter_alpha.setValue(DEFAULT_FILTER_ALPHA)
         self.sb_filter_alpha.setSingleStep(0.05)
         tracking_grid.addWidget(self.sb_filter_alpha, 1, 1)
         
         self.chk_enable_keep_alive = QCheckBox("Duy trì trạng thái khi mất dấu tạm thời")
-        self.chk_enable_keep_alive.setChecked(False)
+        self.chk_enable_keep_alive.setChecked(DEFAULT_ENABLE_KEEP_ALIVE)
         tracking_grid.addWidget(self.chk_enable_keep_alive, 2, 0, 1, 2)
         
         tracking_grid.addWidget(QLabel("Khung hình duy trì tối đa (Max Lost):"), 3, 0)
         self.sb_max_lost_frames = QSpinBox()
         self.sb_max_lost_frames.setRange(1, 100)
-        self.sb_max_lost_frames.setValue(15)
+        self.sb_max_lost_frames.setValue(DEFAULT_MAX_LOST_FRAMES)
         tracking_grid.addWidget(self.sb_max_lost_frames, 3, 1)
         
         tracking_grid.addWidget(QLabel("Độ dài bộ lọc trung bình (khung hình):"), 4, 0)
         self.sb_window_size = QSpinBox()
         self.sb_window_size.setRange(1, 1000)
-        self.sb_window_size.setValue(10) # default window size of 10 frames (highly responsive)
+        self.sb_window_size.setValue(DEFAULT_FILTER_WINDOW_SIZE)
         tracking_grid.addWidget(self.sb_window_size, 4, 1)
         
         left_col.addWidget(tracking_group)
@@ -1703,43 +1746,43 @@ class SettingsDialog(QDialog):
         realsense_grid = QGridLayout(self.realsense_group)
         
         self.chk_decimation = QCheckBox("Decimation Filter (Giảm độ phân giải)")
-        self.chk_decimation.setChecked(False)
+        self.chk_decimation.setChecked(DEFAULT_RS_DECIMATION)
         realsense_grid.addWidget(self.chk_decimation, 0, 0)
         
         self.chk_hole_filling = QCheckBox("Hole Filling Filter (Vá lỗ thủng)")
-        self.chk_hole_filling.setChecked(True)
+        self.chk_hole_filling.setChecked(DEFAULT_RS_HOLE_FILLING)
         realsense_grid.addWidget(self.chk_hole_filling, 0, 1)
         
         self.chk_spatial = QCheckBox("Spatial Filter (Làm mịn không gian)")
-        self.chk_spatial.setChecked(True)
+        self.chk_spatial.setChecked(DEFAULT_RS_SPATIAL)
         realsense_grid.addWidget(self.chk_spatial, 1, 0)
         
         self.chk_temporal = QCheckBox("Temporal Filter (Làm mịn theo thời gian)")
-        self.chk_temporal.setChecked(True)
+        self.chk_temporal.setChecked(DEFAULT_RS_TEMPORAL)
         realsense_grid.addWidget(self.chk_temporal, 1, 1)
         
         self.chk_threshold = QCheckBox("Threshold Filter (Bộ lọc ngưỡng)")
-        self.chk_threshold.setChecked(True)
+        self.chk_threshold.setChecked(DEFAULT_RS_THRESHOLD)
         realsense_grid.addWidget(self.chk_threshold, 2, 0, 1, 2)
         
         realsense_grid.addWidget(QLabel("Ngưỡng Min (mét):"), 3, 0)
         self.sb_threshold_min = QDoubleSpinBox()
         self.sb_threshold_min.setRange(0.1, 10.0)
-        self.sb_threshold_min.setValue(1.0)
+        self.sb_threshold_min.setValue(DEFAULT_RS_THRESHOLD_MIN)
         self.sb_threshold_min.setSingleStep(0.05)
         realsense_grid.addWidget(self.sb_threshold_min, 3, 1)
         
         realsense_grid.addWidget(QLabel("Ngưỡng Max (mét):"), 4, 0)
         self.sb_threshold_max = QDoubleSpinBox()
         self.sb_threshold_max.setRange(0.1, 10.0)
-        self.sb_threshold_max.setValue(4.0)
+        self.sb_threshold_max.setValue(DEFAULT_RS_THRESHOLD_MAX)
         self.sb_threshold_max.setSingleStep(0.1)
         realsense_grid.addWidget(self.sb_threshold_max, 4, 1)
         
         realsense_grid.addWidget(QLabel("Công suất phát Laser (mW):"), 5, 0)
         self.sb_laser_power = QSpinBox()
         self.sb_laser_power.setRange(0, 360)
-        self.sb_laser_power.setValue(150)
+        self.sb_laser_power.setValue(DEFAULT_RS_LASER_POWER)
         self.sb_laser_power.setSingleStep(10)
         self.sb_laser_power.setSuffix(" mW")
         realsense_grid.addWidget(self.sb_laser_power, 5, 1)
@@ -1756,7 +1799,9 @@ class SettingsDialog(QDialog):
         self.cb_zed_resolution.addItem("HD1080 (1920 x 1080)", "HD1080")
         self.cb_zed_resolution.addItem("HD720 (1280 x 720) - Mặc định", "HD720")
         self.cb_zed_resolution.addItem("VGA (672 x 376)", "VGA")
-        self.cb_zed_resolution.setCurrentIndex(2) # Default: HD720
+        # Resolution index mapping from DEFAULT_ZED_RESOLUTION
+        zed_res_map = {"HD2K": 0, "HD1080": 1, "HD720": 2, "VGA": 3}
+        self.cb_zed_resolution.setCurrentIndex(zed_res_map.get(DEFAULT_ZED_RESOLUTION, 2))
         zed_grid.addWidget(self.cb_zed_resolution, 0, 1)
         
         zed_grid.addWidget(QLabel("Chế độ Depth Mode:"), 1, 0)
@@ -1769,39 +1814,41 @@ class SettingsDialog(QDialog):
         self.cb_zed_depth_mode.addItem("ULTRA (Độ chính xác cao - Cũ)", "ULTRA")
         self.cb_zed_depth_mode.addItem("QUALITY (Chất lượng tốt - Cũ)", "QUALITY")
         self.cb_zed_depth_mode.addItem("PERFORMANCE (Hiệu năng cao - Cũ)", "PERFORMANCE")
-        self.cb_zed_depth_mode.setCurrentIndex(0) # Mặc định: NEURAL_PLUS
+        # Depth Mode index mapping from DEFAULT_ZED_DEPTH_MODE
+        zed_depth_modes = ["NEURAL_PLUS", "NEURAL", "NEURAL_LIGHT", "ULTRA", "QUALITY", "PERFORMANCE"]
+        self.cb_zed_depth_mode.setCurrentIndex(zed_depth_modes.index(DEFAULT_ZED_DEPTH_MODE) if DEFAULT_ZED_DEPTH_MODE in zed_depth_modes else 0)
         zed_grid.addWidget(self.cb_zed_depth_mode, 1, 1)
         
         zed_grid.addWidget(QLabel("Chế độ Sensing Mode:"), 2, 0)
         self.cb_zed_sensing_mode = QComboBox()
         self.cb_zed_sensing_mode.addItem("STANDARD (Tiêu chuẩn)", "STANDARD")
         self.cb_zed_sensing_mode.addItem("FILL (Lấp đầy khoảng trống - Vá lỗ)", "FILL")
-        self.cb_zed_sensing_mode.setCurrentIndex(1) # Default: FILL
+        self.cb_zed_sensing_mode.setCurrentIndex(0 if DEFAULT_ZED_SENSING_MODE == "STANDARD" else 1)
         zed_grid.addWidget(self.cb_zed_sensing_mode, 2, 1)
         
         zed_grid.addWidget(QLabel("Ngưỡng tin cậy (Confidence):"), 3, 0)
         self.sb_zed_confidence = QSpinBox()
         self.sb_zed_confidence.setRange(1, 100)
-        self.sb_zed_confidence.setValue(95)
+        self.sb_zed_confidence.setValue(DEFAULT_ZED_CONFIDENCE)
         zed_grid.addWidget(self.sb_zed_confidence, 3, 1)
         
         zed_grid.addWidget(QLabel("Ngưỡng vân bề mặt (Texture Confidence):"), 4, 0)
         self.sb_zed_texture_confidence = QSpinBox()
         self.sb_zed_texture_confidence.setRange(1, 100)
-        self.sb_zed_texture_confidence.setValue(100)
+        self.sb_zed_texture_confidence.setValue(DEFAULT_ZED_TEXTURE_CONFIDENCE)
         zed_grid.addWidget(self.sb_zed_texture_confidence, 4, 1)
         
         zed_grid.addWidget(QLabel("Khoảng cách Depth Min (mét):"), 5, 0)
         self.sb_zed_depth_min = QDoubleSpinBox()
         self.sb_zed_depth_min.setRange(0.1, 10.0)
-        self.sb_zed_depth_min.setValue(0.4)
+        self.sb_zed_depth_min.setValue(DEFAULT_ZED_DEPTH_MIN)
         self.sb_zed_depth_min.setSingleStep(0.05)
         zed_grid.addWidget(self.sb_zed_depth_min, 5, 1)
         
         zed_grid.addWidget(QLabel("Khoảng cách Depth Max (mét):"), 6, 0)
         self.sb_zed_depth_max = QDoubleSpinBox()
         self.sb_zed_depth_max.setRange(1.0, 40.0)
-        self.sb_zed_depth_max.setValue(20.0)
+        self.sb_zed_depth_max.setValue(DEFAULT_ZED_DEPTH_MAX)
         self.sb_zed_depth_max.setSingleStep(0.5)
         zed_grid.addWidget(self.sb_zed_depth_max, 6, 1)
         
@@ -2130,13 +2177,13 @@ class GroundTruthApp(QMainWindow):
         
         # Checkbox for drawing tag 1 trail
         self.chk_draw_trail = QCheckBox("Vẽ vệt di chuyển của Tag 1 (Mờ dần)")
-        self.chk_draw_trail.setChecked(False)
+        self.chk_draw_trail.setChecked(DEFAULT_DRAW_TRAIL)
         self.chk_draw_trail.stateChanged.connect(self.push_config_to_worker)
         stream_grid.addWidget(self.chk_draw_trail, 4, 0, 1, 2)
         
         # Checkbox for using IMU fusion
         self.chk_use_imu = QCheckBox("Sử dụng cảm biến IMU (D455)")
-        self.chk_use_imu.setChecked(False)
+        self.chk_use_imu.setChecked(DEFAULT_USE_IMU)
         self.chk_use_imu.stateChanged.connect(self.push_config_to_worker)
         stream_grid.addWidget(self.chk_use_imu, 5, 0, 1, 2)
         
