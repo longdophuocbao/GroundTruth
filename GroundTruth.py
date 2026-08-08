@@ -17,6 +17,232 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                              QDoubleSpinBox, QSpinBox, QDialog)
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QIcon
 
+class BaseCameraDevice:
+    def open(self):
+        """Mở kết nối camera. Trả về (success, message)."""
+        raise NotImplementedError
+        
+    def close(self):
+        """Đóng kết nối camera."""
+        raise NotImplementedError
+        
+    def get_frames(self, laser_power=150, filters_config=None):
+        """
+        Đọc frame từ camera.
+        Trả về: (success, color_image, depth_frame, gyro_data, intrinsics_dict)
+        """
+        raise NotImplementedError
+
+class RealSenseCameraDevice(BaseCameraDevice):
+    def __init__(self):
+        self.pipeline = None
+        self.align = None
+        self.profile = None
+        self.depth_sensor = None
+        self.enable_imu = False
+        
+        # RealSense Filters
+        self.decimate_filter = rs.decimation_filter()
+        self.spatial_filter = rs.spatial_filter()
+        self.temporal_filter = rs.temporal_filter()
+        self.hole_filling_filter = rs.hole_filling_filter()
+        self.threshold_filter = rs.threshold_filter()
+        self.colorizer = rs.colorizer()
+        
+    def open(self):
+        try:
+            ctx = rs.context()
+            devices = ctx.query_devices()
+            if len(devices) == 0:
+                return False, "Không tìm thấy camera RealSense nào đang kết nối."
+        except Exception as e:
+            return False, f"Lỗi khi quét thiết bị RealSense: {str(e)}"
+            
+        self.pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        
+        self.enable_imu = True
+        try:
+            config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 200)
+            config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
+        except Exception as imu_err:
+            print(f"Không thể kích hoạt luồng IMU: {imu_err}. Chạy không có IMU.")
+            self.enable_imu = False
+            
+        self.align = rs.align(rs.stream.color)
+        
+        try:
+            try:
+                self.profile = self.pipeline.start(config)
+            except Exception as start_err:
+                if self.enable_imu:
+                    # Retry without IMU streams
+                    self.pipeline = rs.pipeline()
+                    config = rs.config()
+                    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+                    self.profile = self.pipeline.start(config)
+                    self.enable_imu = False
+                else:
+                    raise start_err
+                    
+            device = self.profile.get_device()
+            self.depth_sensor = device.first_depth_sensor()
+            if self.depth_sensor:
+                if self.depth_sensor.supports(rs.option.emitter_enabled):
+                    self.depth_sensor.set_option(rs.option.emitter_enabled, 0.0)
+                if self.depth_sensor.supports(rs.option.visual_preset):
+                    self.depth_sensor.set_option(rs.option.visual_preset, 3)
+            return True, "Khởi động RealSense thành công."
+        except Exception as e:
+            return False, f"Không thể khởi động camera RealSense: {str(e)}"
+            
+    def close(self):
+        if self.pipeline:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            self.pipeline = None
+            
+    def get_frames(self, laser_power=150, filters_config=None):
+        if not self.pipeline:
+            return False, None, None, None, None
+            
+        if self.depth_sensor and self.depth_sensor.supports(rs.option.laser_power):
+            try:
+                current_val = self.depth_sensor.get_option(rs.option.laser_power)
+                if abs(current_val - laser_power) > 0.01:
+                    self.depth_sensor.set_option(rs.option.laser_power, float(laser_power))
+            except Exception:
+                pass
+                
+        try:
+            frames = self.pipeline.wait_for_frames()
+            aligned_frames = self.align.process(frames)
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
+            
+            if not color_frame or not depth_frame:
+                return False, None, None, None, None
+                
+            gyro_data = None
+            if self.enable_imu:
+                try:
+                    gyro_frame = frames.first_or_default(rs.stream.gyro)
+                    if gyro_frame:
+                        motion_data = gyro_frame.as_motion_frame().get_motion_data()
+                        gyro_data = [motion_data.x, motion_data.y, motion_data.z]
+                except Exception:
+                    pass
+                    
+            if filters_config:
+                if filters_config.get('enable_threshold', False):
+                    self.threshold_filter.set_option(rs.option.min_distance, filters_config.get('threshold_min', 1.0))
+                    self.threshold_filter.set_option(rs.option.max_distance, filters_config.get('threshold_max', 4.0))
+                    depth_frame = self.threshold_filter.process(depth_frame)
+                if filters_config.get('enable_decimation', False):
+                    depth_frame = self.decimate_filter.process(depth_frame)
+                if filters_config.get('enable_spatial', False):
+                    depth_frame = self.spatial_filter.process(depth_frame)
+                if filters_config.get('enable_temporal', False):
+                    depth_frame = self.temporal_filter.process(depth_frame)
+                if filters_config.get('enable_hole_filling', False):
+                    depth_frame = self.hole_filling_filter.process(depth_frame)
+                    
+            if depth_frame:
+                depth_frame = depth_frame.as_depth_frame()
+                
+            color_image = np.asanyarray(color_frame.get_data()).copy()
+            
+            color_stream = self.profile.get_stream(rs.stream.color)
+            intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
+            intrinsics_dict = {
+                'fx': intrinsics.fx,
+                'fy': intrinsics.fy,
+                'ppx': intrinsics.ppx,
+                'ppy': intrinsics.ppy,
+                'coeffs': intrinsics.coeffs,
+                'raw_intrinsics': intrinsics
+            }
+            
+            return True, color_image, depth_frame, gyro_data, intrinsics_dict
+        except Exception:
+            return False, None, None, None, None
+
+class ZED2iUVCCameraDevice(BaseCameraDevice):
+    def __init__(self, camera_index=0):
+        self.camera_index = camera_index
+        self.cap = None
+        self.intrinsics_dict = None
+        
+    def open(self):
+        # Thử mở camera index (thường là 0 cho ZED 2i UVC)
+        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(self.camera_index)
+            
+        if not self.cap.isOpened():
+            return False, f"Không thể kết nối camera ZED 2i tại index {self.camera_index}"
+            
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            self.cap.release()
+            return False, "Không thể đọc hình ảnh từ ZED 2i."
+            
+        h, w = frame.shape[:2]
+        w_eye = w // 2
+        
+        # FOV ngang tiêu chuẩn của ZED 2i ~ 110 deg, dọc ~ 70 deg
+        hfov_rad = np.deg2rad(110)
+        fx = w_eye / (2 * np.tan(hfov_rad / 2))
+        vfov_rad = np.deg2rad(70)
+        fy = h / (2 * np.tan(vfov_rad / 2))
+        
+        self.intrinsics_dict = {
+            'fx': float(fx),
+            'fy': float(fy),
+            'ppx': float(w_eye / 2.0),
+            'ppy': float(h / 2.0),
+            'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+        return True, "Khởi động ZED 2i (UVC) thành công."
+        
+    def close(self):
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+            
+    def get_frames(self, laser_power=150, filters_config=None):
+        if not self.cap or not self.cap.isOpened():
+            return False, None, None, None, None
+            
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            return False, None, None, None, None
+            
+        h, w = frame.shape[:2]
+        w_eye = w // 2
+        
+        color_image = frame[:, :w_eye].copy()
+        
+        depth_frame = None
+        gyro_data = None
+        
+        fx = w_eye / (2 * np.tan(np.deg2rad(110) / 2))
+        fy = h / (2 * np.tan(np.deg2rad(70) / 2))
+        self.intrinsics_dict = {
+            'fx': float(fx),
+            'fy': float(fy),
+            'ppx': float(w_eye / 2.0),
+            'ppy': float(h / 2.0),
+            'coeffs': [0.0, 0.0, 0.0, 0.0, 0.0]
+        }
+        
+        return True, color_image, depth_frame, gyro_data, self.intrinsics_dict
+
 class TagTracker:
     def __init__(self, tag_id, alpha=0.7, max_lost_frames=15):
         self.tag_id = tag_id
@@ -77,6 +303,7 @@ class CameraWorker(QThread):
         self._mutex = QMutex()
         
         # Thread-safe config parameters
+        self._camera_type = "realsense" # "realsense" or "zed_uvc"
         self._tag_size = 0.150 # meters (150mm)
         self._source_id = 1
         self._target_ids_str = ""
@@ -127,7 +354,7 @@ class CameraWorker(QThread):
     def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
                       filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                       enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                      threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu):
+                      threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type="realsense"):
         with QMutexLocker(self._mutex):
             self._tag_size = tag_size
             self._source_id = source_id
@@ -149,6 +376,7 @@ class CameraWorker(QThread):
             self._use_ref_map = use_ref_map
             self._reference_map = reference_map
             self._use_imu = use_imu
+            self._camera_type = camera_type
             self._filtered_R_A = None
             self._filtered_P_A = None
 
@@ -203,104 +431,36 @@ class CameraWorker(QThread):
 
     def run(self):
         self.running = True
-        self.status_msg.emit("Đang quét kết nối thiết bị RealSense...")
-        try:
-            ctx = rs.context()
-            devices = ctx.query_devices()
-            if len(devices) == 0:
-                self.error_occurred.emit("Không tìm thấy camera Intel RealSense nào đang kết nối. Vui lòng kiểm tra lại cáp cắm.")
-                self.running = False
-                return
-        except Exception as e:
-            self.error_occurred.emit(f"Lỗi khi kiểm tra thiết bị: {str(e)}")
-            self.running = False
-            return
+        
+        # Đọc camera_type trong thread-safe
+        with QMutexLocker(self._mutex):
+            camera_type = self._camera_type
             
-        self.status_msg.emit("Đang khởi tạo camera RealSense...")
-        
-        # Create pipeline and config
-        pipeline = rs.pipeline()
-        config = rs.config()
-        
-        # Configure streams (D455 supports 640x480 for color and depth)
-        config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-        
-        # Try to enable IMU streams (accel and gyro)
-        enable_imu = True
-        try:
-            config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 200)
-            config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
-        except Exception as imu_err:
-            print(f"Không thể kích hoạt luồng IMU: {imu_err}. Chạy không có IMU.")
-            enable_imu = False
+        if camera_type == "realsense":
+            self.status_msg.emit("Đang khởi tạo camera RealSense...")
+            camera = RealSenseCameraDevice()
+        else:
+            self.status_msg.emit("Đang khởi tạo camera ZED 2i (UVC Mode)...")
+            camera = ZED2iUVCCameraDevice(camera_index=0)
             
-        align = rs.align(rs.stream.color)
-        
-        try:
-            try:
-                profile = pipeline.start(config)
-            except Exception as start_err:
-                if enable_imu:
-                    # Retry without IMU streams
-                    pipeline = rs.pipeline()
-                    config = rs.config()
-                    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-                    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-                    profile = pipeline.start(config)
-                    enable_imu = False
-                    self.status_msg.emit("Khởi động camera thành công (Đã bỏ qua luồng IMU).")
-                else:
-                    raise start_err
-                    
-            device = profile.get_device()
-            depth_sensor = device.first_depth_sensor()
-            # --- CẤU HÌNH TỐI ƯU NGOÀI TRỜI ---                                                                
-            if depth_sensor:                                                                                    
-                # 1. Tắt Emitter để tránh nhiễu ánh sáng mặt trời                                               
-                if depth_sensor.supports(rs.option.emitter_enabled):                                            
-                    depth_sensor.set_option(rs.option.emitter_enabled, 0.0)                                     
-                                                                                                                
-                # 2. Đặt Preset về High Accuracy (3) hoặc Remove IR Pattern (6)                                 
-                if depth_sensor.supports(rs.option.visual_preset):                                              
-                    depth_sensor.set_option(rs.option.visual_preset, 3)                                         
-            # ----------------------------------                     
-            self.status_msg.emit("Đang kết nối. Pipeline bắt đầu hoạt động.")
-        except Exception as e:
-            self.error_occurred.emit(f"Không thể khởi động camera: {str(e)}")
+        success, msg = camera.open()
+        if not success:
+            self.error_occurred.emit(msg)
             self.running = False
             return
             
         try:
-            # Retrieve camera intrinsics
-            color_stream = profile.get_stream(rs.stream.color)
-            intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
-            
-            cam_matrix = np.array([
-                [intrinsics.fx, 0, intrinsics.ppx],
-                [0, intrinsics.fy, intrinsics.ppy],
-                [0, 0, 1]
-            ], dtype=np.float32)
-            dist_coeffs = np.array(intrinsics.coeffs, dtype=np.float32)
-            
             # Initialize AprilTag detector (using Aruco module in OpenCV 5)
             dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
             parameters = cv2.aruco.DetectorParameters()
             detector = cv2.aruco.ArucoDetector(dictionary, parameters)
             
-            # Initialize RealSense SDK post-processing filters
-            decimate_filter = rs.decimation_filter()
-            spatial_filter = rs.spatial_filter()
-            temporal_filter = rs.temporal_filter()
-            hole_filling_filter = rs.hole_filling_filter()
-            threshold_filter = rs.threshold_filter()
-            colorizer = rs.colorizer()
-            
             # Wait for sensors to warm up/auto-exposure to stabilize
             for _ in range(10):
                 if not self.running:
                     break
-                pipeline.wait_for_frames()
+                camera.get_frames()
+                time.sleep(0.05)
                 
             self.status_msg.emit("Camera đang phát truyền hình trực tiếp.")
             
@@ -312,36 +472,6 @@ class CameraWorker(QThread):
             last_time = time.time()
             
             while self.running:
-                frames = pipeline.wait_for_frames()
-                
-                # Align depth frame to color frame
-                aligned_frames = align.process(frames)
-                color_frame = aligned_frames.get_color_frame()
-                depth_frame = aligned_frames.get_depth_frame()
-                
-                if not color_frame or not depth_frame:
-                    continue
-                    
-                # Get IMU data if enabled
-                gyro_data = None
-                if enable_imu:
-                    try:
-                        gyro_frame = frames.first_or_default(rs.stream.gyro)
-                        if gyro_frame:
-                            motion_data = gyro_frame.as_motion_frame().get_motion_data()
-                            gyro_data = [motion_data.x, motion_data.y, motion_data.z]
-                    except Exception:
-                        pass
-                        
-                current_time = time.time()
-                dt = current_time - last_time
-                last_time = current_time
-                if dt <= 0 or dt > 0.5:
-                    dt = 0.033
-                    
-                # Convert frames to numpy arrays
-                color_image = np.asanyarray(color_frame.get_data()).copy()
-                
                 # Read latest config variables in a thread-safe way
                 with QMutexLocker(self._mutex):
                     tag_size = self._tag_size
@@ -353,46 +483,44 @@ class CameraWorker(QThread):
                     max_lost_frames = self._max_lost_frames
                     enable_smoothing = self._enable_smoothing
                     enable_keep_alive = self._enable_keep_alive
-                    enable_decimation = self._enable_decimation
-                    enable_hole_filling = self._enable_hole_filling
-                    enable_spatial = self._enable_spatial
-                    enable_temporal = self._enable_temporal
-                    enable_threshold = self._enable_threshold
-                    threshold_min = self._threshold_min
-                    threshold_max = self._threshold_max
+                    
+                    filters_config = {
+                        'enable_decimation': self._enable_decimation,
+                        'enable_hole_filling': self._enable_hole_filling,
+                        'enable_spatial': self._enable_spatial,
+                        'enable_temporal': self._enable_temporal,
+                        'enable_threshold': self._enable_threshold,
+                        'threshold_min': self._threshold_min,
+                        'threshold_max': self._threshold_max
+                    }
                     laser_power = self._laser_power
                     use_ref_map = self._use_ref_map
                     reference_map = self._reference_map
                     use_imu = self._use_imu
                 
-                # Apply Laser Power dynamically
-                if depth_sensor and depth_sensor.supports(rs.option.laser_power):
-                    try:
-                        current_val = depth_sensor.get_option(rs.option.laser_power)
-                        if abs(current_val - laser_power) > 0.01:
-                            depth_sensor.set_option(rs.option.laser_power, float(laser_power))
-                    except Exception:
-                        pass
-                
-                # Apply RealSense SDK post-processing filters to depth_frame
-                if enable_threshold:
-                    threshold_filter.set_option(rs.option.min_distance, threshold_min)
-                    threshold_filter.set_option(rs.option.max_distance, threshold_max)
-                    depth_frame = threshold_filter.process(depth_frame)
-                if enable_decimation:
-                    depth_frame = decimate_filter.process(depth_frame)
-                if enable_spatial:
-                    depth_frame = spatial_filter.process(depth_frame)
-                if enable_temporal:
-                    depth_frame = temporal_filter.process(depth_frame)
-                if enable_hole_filling:
-                    depth_frame = hole_filling_filter.process(depth_frame)
-                
-                # Cast the processed frame back to a depth_frame to expose get_width(), get_height(), get_distance()
-                if depth_frame:
-                    depth_frame = depth_frame.as_depth_frame()
-                if not depth_frame:
+                # Get frames from camera
+                success_frames, color_image, depth_frame, gyro_data, intrinsics_dict = camera.get_frames(laser_power, filters_config)
+                if not success_frames or color_image is None:
+                    time.sleep(0.01)
                     continue
+                    
+                # Chỉ kiểm tra depth_frame nếu là camera RealSense có hỗ trợ độ sâu phần cứng
+                if camera_type == "realsense" and depth_frame is None:
+                    continue
+                        
+                current_time = time.time()
+                dt = current_time - last_time
+                last_time = current_time
+                if dt <= 0 or dt > 0.5:
+                    dt = 0.033
+                    
+                # Retrieve camera intrinsics
+                cam_matrix = np.array([
+                    [intrinsics_dict['fx'], 0, intrinsics_dict['ppx']],
+                    [0, intrinsics_dict['fy'], intrinsics_dict['ppy']],
+                    [0, 0, 1]
+                ], dtype=np.float32)
+                dist_coeffs = np.array(intrinsics_dict['coeffs'], dtype=np.float32)
                 
                 # Grayscale for AprilTag detection
                 gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
@@ -430,29 +558,39 @@ class CameraWorker(QThread):
                         
                         # Retrieve 3D point via Depth sensor
                         depth_val = 0.0
-                        depth_w = depth_frame.get_width()
-                        depth_h = depth_frame.get_height()
-                        color_h, color_w = color_image.shape[:2]
-                        
-                        u_c_depth = int(u_c * depth_w / color_w)
-                        v_c_depth = int(v_c * depth_h / color_h)
-                        
-                        depths = []
-                        for dy in range(-2, 3):
-                            for dx in range(-2, 3):
-                                nu, nv = u_c_depth + dx, v_c_depth + dy
-                                if 0 <= nu < depth_w and 0 <= nv < depth_h:
-                                    d = depth_frame.get_distance(nu, nv)
-                                    if d > 0.0:
-                                        depths.append(d)
-                        if depths:
-                            depth_val = float(np.median(depths))
+                        if depth_frame is not None:
+                            depth_w = depth_frame.get_width()
+                            depth_h = depth_frame.get_height()
+                            color_h, color_w = color_image.shape[:2]
                             
-                        # Deproject depth-based center
-                        if depth_val > 0.0:
-                            p_3d_depth = np.array(rs.rs2_deproject_pixel_to_point(intrinsics, [u_c, v_c], depth_val))
+                            u_c_depth = int(u_c * depth_w / color_w)
+                            v_c_depth = int(v_c * depth_h / color_h)
+                            
+                            depths = []
+                            for dy in range(-2, 3):
+                                for dx in range(-2, 3):
+                                    nu, nv = u_c_depth + dx, v_c_depth + dy
+                                    if 0 <= nu < depth_w and 0 <= nv < depth_h:
+                                        d = depth_frame.get_distance(nu, nv)
+                                        if d > 0.0:
+                                            depths.append(d)
+                            if depths:
+                                depth_val = float(np.median(depths))
+                                
+                            # Deproject depth-based center
+                            if depth_val > 0.0:
+                                if 'raw_intrinsics' in intrinsics_dict:
+                                    p_3d_depth = np.array(rs.rs2_deproject_pixel_to_point(intrinsics_dict['raw_intrinsics'], [u_c, v_c], depth_val))
+                                else:
+                                    # simple fallback projection formula
+                                    z = depth_val
+                                    x = (u_c - intrinsics_dict['ppx']) * z / intrinsics_dict['fx']
+                                    y = (v_c - intrinsics_dict['ppy']) * z / intrinsics_dict['fy']
+                                    p_3d_depth = np.array([x, y, z])
+                            else:
+                                p_3d_depth = np.array([0.0, 0.0, 0.0])
                         else:
-                            p_3d_depth = np.array([0.0, 0.0, 0.0])
+                            p_3d_depth = p_3d_pnp.copy()
                             
                         detected_tags_raw[tag_id] = {
                             'corners': corners_i,
@@ -864,20 +1002,26 @@ class CameraWorker(QThread):
                     self._write_log_row(results, source_id, source_pos, target_ids)
                 
                 # Generate colorized depth image to send to GUI
-                colorized_depth = colorizer.colorize(depth_frame)
-                depth_image = np.asanyarray(colorized_depth.get_data()).copy()
+                if depth_frame is not None and hasattr(camera, 'colorizer'):
+                    try:
+                        colorized_depth = camera.colorizer.colorize(depth_frame)
+                        depth_image = np.asanyarray(colorized_depth.get_data()).copy()
+                    except Exception:
+                        depth_image = None
+                else:
+                    depth_image = None
                 results['depth_image'] = depth_image
                 
                 # Send frame and results to GUI
                 self.frame_ready.emit(color_image, results)
                 
-            pipeline.stop()
+            camera.close()
             self.status_msg.emit("Đã dừng truyền hình. Camera ở trạng thái nghỉ.")
             
         except Exception as e:
             self.error_occurred.emit(f"Lỗi trong vòng lặp xử lý: {str(e)}")
             try:
-                pipeline.stop()
+                camera.close()
             except Exception:
                 pass
             self.running = False
@@ -1440,58 +1584,65 @@ class GroundTruthApp(QMainWindow):
         stream_group = QGroupBox("ĐIỀU KHIỂN THIẾT BỊ")
         stream_grid = QGridLayout(stream_group)
         
+        self.lbl_camera_source = QLabel("Chọn Camera:")
+        self.cmb_camera_source = QComboBox()
+        self.cmb_camera_source.addItems(["Intel RealSense D455", "ZED 2i (UVC Mode)"])
+        self.cmb_camera_source.currentIndexChanged.connect(self.on_camera_source_changed)
+        stream_grid.addWidget(self.lbl_camera_source, 0, 0, 1, 1)
+        stream_grid.addWidget(self.cmb_camera_source, 0, 1, 1, 1)
+        
         self.btn_scan = QPushButton("Quét Thiết Bị (Scan)")
         self.btn_scan.setObjectName("btn_normal")
         self.btn_scan.clicked.connect(self.scan_devices)
-        stream_grid.addWidget(self.btn_scan, 0, 0, 1, 2)
+        stream_grid.addWidget(self.btn_scan, 1, 0, 1, 2)
         
         self.btn_toggle_stream = QPushButton("Run")
         self.btn_toggle_stream.setObjectName("btn_start")
         self.btn_toggle_stream.clicked.connect(self.toggle_camera_stream)
-        stream_grid.addWidget(self.btn_toggle_stream, 1, 0, 1, 2)
+        stream_grid.addWidget(self.btn_toggle_stream, 2, 0, 1, 2)
         
         # Checkbox to toggle depth view
         self.chk_show_depth = QCheckBox("Hiển thị camera Depth chiều sâu")
         self.chk_show_depth.setChecked(False)
         self.chk_show_depth.stateChanged.connect(self.toggle_depth_visibility)
-        stream_grid.addWidget(self.chk_show_depth, 2, 0, 1, 2)
+        stream_grid.addWidget(self.chk_show_depth, 3, 0, 1, 2)
         
         # Checkbox for using reference map
         self.chk_use_ref_map = QCheckBox("Sử dụng bản đồ tham chiếu (Giảm nhiễu)")
         self.chk_use_ref_map.setChecked(False)
         self.chk_use_ref_map.setEnabled(False)
         self.chk_use_ref_map.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_use_ref_map, 3, 0, 1, 2)
+        stream_grid.addWidget(self.chk_use_ref_map, 4, 0, 1, 2)
         
         # Checkbox for using IMU fusion
         self.chk_use_imu = QCheckBox("Sử dụng cảm biến IMU (D455)")
         self.chk_use_imu.setChecked(True)
         self.chk_use_imu.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_use_imu, 4, 0, 1, 2)
+        stream_grid.addWidget(self.chk_use_imu, 5, 0, 1, 2)
         
         # Button to reset/start new map
         self.btn_reset_map = QPushButton("Tạo bản đồ mới (Xóa dữ liệu cũ)")
         self.btn_reset_map.setObjectName("btn_stop")
         self.btn_reset_map.setEnabled(False)
         self.btn_reset_map.clicked.connect(self.reset_map_calibration)
-        stream_grid.addWidget(self.btn_reset_map, 5, 0, 1, 2)
+        stream_grid.addWidget(self.btn_reset_map, 6, 0, 1, 2)
         
         # Button to append to map (Cuốn chiếu)
         self.btn_calibrate_map = QPushButton("Quét & Nối Tag (Cuốn chiếu)")
         self.btn_calibrate_map.setObjectName("btn_normal")
         self.btn_calibrate_map.setEnabled(False)
         self.btn_calibrate_map.clicked.connect(self.start_map_calibration)
-        stream_grid.addWidget(self.btn_calibrate_map, 6, 0, 1, 2)
+        stream_grid.addWidget(self.btn_calibrate_map, 7, 0, 1, 2)
 
         self.btn_save_map = QPushButton("Lưu file (Save)")
         self.btn_save_map.setObjectName("btn_normal")
         self.btn_save_map.clicked.connect(self.save_map_file)
-        stream_grid.addWidget(self.btn_save_map, 7, 0, 1, 1)
+        stream_grid.addWidget(self.btn_save_map, 8, 0, 1, 1)
         
         self.btn_load_map = QPushButton("Tải file (Load)")
         self.btn_load_map.setObjectName("btn_normal")
         self.btn_load_map.clicked.connect(self.load_map_file)
-        stream_grid.addWidget(self.btn_load_map, 7, 1, 1, 1)
+        stream_grid.addWidget(self.btn_load_map, 8, 1, 1, 1)
         
         right_layout.addWidget(stream_group)
         
@@ -1737,36 +1888,103 @@ class GroundTruthApp(QMainWindow):
         reference_map = self.reference_map
         use_imu = self.chk_use_imu.isChecked()
         
+        camera_type = "zed_uvc" if self.cmb_camera_source.currentIndex() == 1 else "realsense"
+        
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                                   enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                                  threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu)
+                                  threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type)
         
+    def on_camera_source_changed(self, index):
+        camera_type = "zed_uvc" if index == 1 else "realsense"
+        if camera_type == "zed_uvc":
+            self.chk_use_imu.setChecked(False)
+            self.chk_use_imu.setEnabled(False)
+            self.chk_show_depth.setChecked(False)
+            self.chk_show_depth.setEnabled(False)
+            self.status_bar_lbl.setText("Đã chuyển sang ZED 2i (UVC Mode). Khuyên dùng chế độ đo PnP.")
+            
+            # Tự động chuyển mode trong settings sang PnP
+            self.settings_dialog.cb_coord_mode.setCurrentIndex(1) # pnp mode
+        else:
+            self.chk_use_imu.setEnabled(True)
+            self.chk_use_imu.setChecked(True)
+            self.chk_show_depth.setEnabled(True)
+            self.status_bar_lbl.setText("Đã chuyển sang Intel RealSense D455.")
+            self.settings_dialog.cb_coord_mode.setCurrentIndex(0) # depth mode
+            
     def scan_devices(self):
         self.status_bar_lbl.setText("Đang quét thiết bị camera...")
         QApplication.processEvents()
-        try:
-            ctx = rs.context()
-            devices = ctx.query_devices()
-            if len(devices) == 0:
-                self.status_bar_lbl.setText("Không tìm thấy camera RealSense.")
-                QMessageBox.warning(self, "Quét Thiết Bị", 
-                                    "Không phát hiện thấy camera Intel RealSense nào đang kết nối.\n"
-                                    "Vui lòng kiểm tra lại cáp kết nối USB 3.0 và đảm bảo camera đã được cắm.")
-            else:
-                dev_list = []
-                for i, dev in enumerate(devices):
-                    name = dev.get_info(rs.camera_info.name)
-                    sn = dev.get_info(rs.camera_info.serial_number)
-                    dev_list.append(f"• {name} (S/N: {sn})")
-                
-                self.status_bar_lbl.setText(f"Đã tìm thấy {len(devices)} thiết bị.")
-                devs_text = "\n".join(dev_list)
-                QMessageBox.information(self, "Quét Thiết Bị", 
-                                        f"Đã phát hiện thấy {len(devices)} thiết bị RealSense kết nối:\n\n{devs_text}")
-        except Exception as e:
-            self.status_bar_lbl.setText("Lỗi khi quét thiết bị.")
-            QMessageBox.critical(self, "Lỗi Quét Thiết Bị", f"Lỗi xảy ra trong quá trình quét: {str(e)}")
+        
+        camera_type = "zed_uvc" if self.cmb_camera_source.currentIndex() == 1 else "realsense"
+        
+        if camera_type == "realsense":
+            try:
+                ctx = rs.context()
+                devices = ctx.query_devices()
+                if len(devices) == 0:
+                    self.status_bar_lbl.setText("Không tìm thấy camera RealSense.")
+                    QMessageBox.warning(self, "Quét Thiết Bị", 
+                                        "Không phát hiện thấy camera Intel RealSense nào đang kết nối.\n"
+                                        "Vui lòng kiểm tra lại cáp kết nối USB 3.0 và đảm bảo camera đã được cắm.")
+                else:
+                    dev_list = []
+                    for i, dev in enumerate(devices):
+                        name = dev.get_info(rs.camera_info.name)
+                        sn = dev.get_info(rs.camera_info.serial_number)
+                        dev_list.append(f"• {name} (S/N: {sn})")
+                    
+                    self.status_bar_lbl.setText(f"Đã tìm thấy {len(devices)} thiết bị.")
+                    devs_text = "\n".join(dev_list)
+                    QMessageBox.information(self, "Quét Thiết Bị", 
+                                            f"Đã phát hiện thấy {len(devices)} thiết bị RealSense kết nối:\n\n{devs_text}")
+            except Exception as e:
+                self.status_bar_lbl.setText("Lỗi khi quét thiết bị.")
+                QMessageBox.critical(self, "Lỗi Quét Thiết Bị", f"Lỗi xảy ra trong quá trình quét: {str(e)}")
+        else:
+            try:
+                # Quét thử ZED UVC trên các cổng video
+                zed_found = False
+                zed_index = 0
+                for index in range(5):
+                    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(index)
+                    if cap.isOpened():
+                        w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                        h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                        cap.release()
+                        # ZED 2i ở chế độ UVC thường có độ phân giải side-by-side 1344x376
+                        if w == 1344 and h == 376 or (w > 0 and w == h * 2 * 1.78):
+                            zed_found = True
+                            zed_index = index
+                            break
+                            
+                if zed_found:
+                    self.status_bar_lbl.setText(f"Đã tìm thấy camera ZED 2i tại index {zed_index}.")
+                    QMessageBox.information(self, "Quét Thiết Bị", 
+                                            f"Đã phát hiện thấy camera ZED 2i kết nối ở chế độ UVC (Index: {zed_index}).\n"
+                                            f"Độ phân giải: 1344x376 (Side-by-Side).")
+                else:
+                    # Mở thử index 0
+                    cap = cv2.VideoCapture(0)
+                    if cap.isOpened():
+                        w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+                        h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+                        cap.release()
+                        self.status_bar_lbl.setText("Không chắc chắn là ZED, nhưng phát hiện camera tại index 0.")
+                        QMessageBox.information(self, "Quét Thiết Bị", 
+                                                f"Không tìm thấy ZED 2i 1344x376, nhưng phát hiện camera ở Index 0 ({int(w)}x{int(h)}).\n"
+                                                f"Chúng tôi sẽ thử kết nối với cổng này làm ZED 2i.")
+                    else:
+                        self.status_bar_lbl.setText("Không tìm thấy camera ZED 2i.")
+                        QMessageBox.warning(self, "Quét Thiết Bị", 
+                                            "Không phát hiện thấy camera ZED 2i nào đang kết nối ở chế độ UVC.\n"
+                                            "Vui lòng kiểm tra lại cáp cắm USB 3.0.")
+            except Exception as e:
+                self.status_bar_lbl.setText("Lỗi khi quét thiết bị ZED.")
+                QMessageBox.critical(self, "Lỗi Quét Thiết Bị", f"Lỗi xảy ra: {str(e)}")
 
     def toggle_camera_stream(self):
         if self.worker.isRunning():
@@ -1775,18 +1993,29 @@ class GroundTruthApp(QMainWindow):
             self.start_camera_stream()
 
     def start_camera_stream(self):
-        # Kiểm tra thiết bị RealSense trước để tránh treo app
-        try:
-            ctx = rs.context()
-            devices = ctx.query_devices()
-            if len(devices) == 0:
-                QMessageBox.warning(self, "Không tìm thấy camera", 
-                                    "Không thể bắt đầu. Không phát hiện thấy camera Intel RealSense nào đang kết nối.\n"
-                                    "Vui lòng kiểm tra lại cáp cắm và thử lại.")
+        camera_type = "zed_uvc" if self.cmb_camera_source.currentIndex() == 1 else "realsense"
+        
+        if camera_type == "realsense":
+            try:
+                ctx = rs.context()
+                devices = ctx.query_devices()
+                if len(devices) == 0:
+                    QMessageBox.warning(self, "Không tìm thấy camera", 
+                                        "Không thể bắt đầu. Không phát hiện thấy camera Intel RealSense nào đang kết nối.\n"
+                                        "Vui lòng kiểm tra lại cáp cắm và thử lại.")
+                    return
+            except Exception as e:
+                QMessageBox.critical(self, "Lỗi kiểm tra camera", f"Có lỗi xảy ra khi kiểm tra camera: {str(e)}")
                 return
-        except Exception as e:
-            QMessageBox.critical(self, "Lỗi kiểm tra camera", f"Có lỗi xảy ra khi kiểm tra camera: {str(e)}")
-            return
+        else:
+            # Kiểm tra xem ZED 2i UVC có mở được không
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                QMessageBox.warning(self, "Không tìm thấy camera", 
+                                    "Không thể bắt đầu. Không phát hiện thấy camera ZED 2i nào ở Index 0.\n"
+                                    "Vui lòng kiểm tra lại kết nối USB.")
+                return
+            cap.release()
 
         self.push_config_to_worker()
         self.btn_toggle_stream.setText("Stop")
@@ -1802,7 +2031,7 @@ class GroundTruthApp(QMainWindow):
         self.fps_counter = 0
         
         self.worker.start()
-        
+
     def stop_camera_stream(self):
         self.chk_logging.setChecked(False) # Turn off logger if camera is stopped
         self.worker.stop()
@@ -1976,7 +2205,7 @@ class GroundTruthApp(QMainWindow):
         self.video_label.setPixmap(scaled_pixmap)
         
         # Display depth image if the checkbox is checked and depth data is available
-        if self.chk_show_depth.isChecked() and 'depth_image' in results:
+        if self.chk_show_depth.isChecked() and 'depth_image' in results and results['depth_image'] is not None:
             depth_bgr = results['depth_image']
             dh, dw, dch = depth_bgr.shape
             d_bytes_per_line = dch * dw
