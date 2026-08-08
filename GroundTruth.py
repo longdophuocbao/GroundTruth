@@ -335,11 +335,23 @@ class ZED2iSDKCameraDevice(BaseCameraDevice):
             
         self.zed = sl.Camera()
         self.init_params = sl.InitParameters()
-        self.init_params.camera_resolution = sl.RESOLUTION.HD720
+        
+        # Cấu hình độ phân giải camera từ zed_config
+        resolution_str = "HD720"
+        if zed_config and 'resolution' in zed_config:
+            resolution_str = zed_config['resolution']
+            
+        resolution_map = {
+            "HD2K": sl.RESOLUTION.HD2K,
+            "HD1080": sl.RESOLUTION.HD1080,
+            "HD720": sl.RESOLUTION.HD720,
+            "VGA": sl.RESOLUTION.VGA
+        }
+        self.init_params.camera_resolution = resolution_map.get(resolution_str, sl.RESOLUTION.HD720)
         self.init_params.camera_fps = 30
         
         # Áp dụng depth_mode từ cấu hình
-        depth_mode_str = "NEURAL"
+        depth_mode_str = "NEURAL_PLUS"
         if zed_config and 'depth_mode' in zed_config:
             depth_mode_str = zed_config['depth_mode']
             
@@ -417,7 +429,7 @@ class ZED2iSDKCameraDevice(BaseCameraDevice):
         try:
             import pyzed.sl as sl
             # Chế độ cảm nhận (Sensing Mode) hoặc Vá lỗ hổng (Fill Mode) tùy theo phiên bản SDK
-            sensing_mode_str = zed_config.get('sensing_mode', 'STANDARD')
+            sensing_mode_str = zed_config.get('sensing_mode', 'FILL')
             is_fill = (sensing_mode_str == 'FILL')
             if hasattr(sl, 'SENSING_MODE'):
                 if is_fill:
@@ -597,8 +609,9 @@ class CameraWorker(QThread):
         
         # ZED SDK Config default parameters
         self._zed_config = {
-            'depth_mode': 'ULTRA',
-            'sensing_mode': 'STANDARD',
+            'resolution': 'HD720',
+            'depth_mode': 'NEURAL_PLUS',
+            'sensing_mode': 'FILL',
             'confidence': 95,
             'texture_confidence': 100,
             'depth_min': 0.4,
@@ -1693,7 +1706,16 @@ class SettingsDialog(QDialog):
         self.zed_sdk_group = QGroupBox("CẤU HÌNH CHIỀU SÂU ZED SDK (CUDA)")
         zed_grid = QGridLayout(self.zed_sdk_group)
         
-        zed_grid.addWidget(QLabel("Chế độ Depth Mode:"), 0, 0)
+        zed_grid.addWidget(QLabel("Độ phân giải (Resolution):"), 0, 0)
+        self.cb_zed_resolution = QComboBox()
+        self.cb_zed_resolution.addItem("HD2K (2208 x 1242)", "HD2K")
+        self.cb_zed_resolution.addItem("HD1080 (1920 x 1080)", "HD1080")
+        self.cb_zed_resolution.addItem("HD720 (1280 x 720) - Mặc định", "HD720")
+        self.cb_zed_resolution.addItem("VGA (672 x 376)", "VGA")
+        self.cb_zed_resolution.setCurrentIndex(2) # Default: HD720
+        zed_grid.addWidget(self.cb_zed_resolution, 0, 1)
+        
+        zed_grid.addWidget(QLabel("Chế độ Depth Mode:"), 1, 0)
         self.cb_zed_depth_mode = QComboBox()
         # ZED SDK 5.x Neural modes (Khuyên dùng)
         self.cb_zed_depth_mode.addItem("NEURAL_PLUS (Độ chính xác tối đa - AI+)", "NEURAL_PLUS")
@@ -1703,41 +1725,41 @@ class SettingsDialog(QDialog):
         self.cb_zed_depth_mode.addItem("ULTRA (Độ chính xác cao - Cũ)", "ULTRA")
         self.cb_zed_depth_mode.addItem("QUALITY (Chất lượng tốt - Cũ)", "QUALITY")
         self.cb_zed_depth_mode.addItem("PERFORMANCE (Hiệu năng cao - Cũ)", "PERFORMANCE")
-        self.cb_zed_depth_mode.setCurrentIndex(1) # Mặc định: NEURAL (Cân bằng - AI)
-        zed_grid.addWidget(self.cb_zed_depth_mode, 0, 1)
+        self.cb_zed_depth_mode.setCurrentIndex(0) # Mặc định: NEURAL_PLUS
+        zed_grid.addWidget(self.cb_zed_depth_mode, 1, 1)
         
-        zed_grid.addWidget(QLabel("Chế độ Sensing Mode:"), 1, 0)
+        zed_grid.addWidget(QLabel("Chế độ Sensing Mode:"), 2, 0)
         self.cb_zed_sensing_mode = QComboBox()
         self.cb_zed_sensing_mode.addItem("STANDARD (Tiêu chuẩn)", "STANDARD")
         self.cb_zed_sensing_mode.addItem("FILL (Lấp đầy khoảng trống - Vá lỗ)", "FILL")
-        self.cb_zed_sensing_mode.setCurrentIndex(0) # Default: STANDARD
-        zed_grid.addWidget(self.cb_zed_sensing_mode, 1, 1)
+        self.cb_zed_sensing_mode.setCurrentIndex(1) # Default: FILL
+        zed_grid.addWidget(self.cb_zed_sensing_mode, 2, 1)
         
-        zed_grid.addWidget(QLabel("Ngưỡng tin cậy (Confidence):"), 2, 0)
+        zed_grid.addWidget(QLabel("Ngưỡng tin cậy (Confidence):"), 3, 0)
         self.sb_zed_confidence = QSpinBox()
         self.sb_zed_confidence.setRange(1, 100)
         self.sb_zed_confidence.setValue(95)
-        zed_grid.addWidget(self.sb_zed_confidence, 2, 1)
+        zed_grid.addWidget(self.sb_zed_confidence, 3, 1)
         
-        zed_grid.addWidget(QLabel("Ngưỡng vân bề mặt (Texture Confidence):"), 3, 0)
+        zed_grid.addWidget(QLabel("Ngưỡng vân bề mặt (Texture Confidence):"), 4, 0)
         self.sb_zed_texture_confidence = QSpinBox()
         self.sb_zed_texture_confidence.setRange(1, 100)
         self.sb_zed_texture_confidence.setValue(100)
-        zed_grid.addWidget(self.sb_zed_texture_confidence, 3, 1)
+        zed_grid.addWidget(self.sb_zed_texture_confidence, 4, 1)
         
-        zed_grid.addWidget(QLabel("Khoảng cách Depth Min (mét):"), 4, 0)
+        zed_grid.addWidget(QLabel("Khoảng cách Depth Min (mét):"), 5, 0)
         self.sb_zed_depth_min = QDoubleSpinBox()
         self.sb_zed_depth_min.setRange(0.1, 10.0)
         self.sb_zed_depth_min.setValue(0.4)
         self.sb_zed_depth_min.setSingleStep(0.05)
-        zed_grid.addWidget(self.sb_zed_depth_min, 4, 1)
+        zed_grid.addWidget(self.sb_zed_depth_min, 5, 1)
         
-        zed_grid.addWidget(QLabel("Khoảng cách Depth Max (mét):"), 5, 0)
+        zed_grid.addWidget(QLabel("Khoảng cách Depth Max (mét):"), 6, 0)
         self.sb_zed_depth_max = QDoubleSpinBox()
         self.sb_zed_depth_max.setRange(1.0, 40.0)
         self.sb_zed_depth_max.setValue(20.0)
         self.sb_zed_depth_max.setSingleStep(0.5)
-        zed_grid.addWidget(self.sb_zed_depth_max, 5, 1)
+        zed_grid.addWidget(self.sb_zed_depth_max, 6, 1)
         
         layout.addWidget(self.zed_sdk_group)
         
@@ -1838,6 +1860,7 @@ class SettingsDialog(QDialog):
             self.sb_laser_power.valueChanged.connect(parent.push_config_to_worker)
             
             # ZED SDK signals
+            self.cb_zed_resolution.currentIndexChanged.connect(parent.push_config_to_worker)
             self.cb_zed_depth_mode.currentIndexChanged.connect(parent.push_config_to_worker)
             self.cb_zed_sensing_mode.currentIndexChanged.connect(parent.push_config_to_worker)
             self.sb_zed_confidence.valueChanged.connect(parent.push_config_to_worker)
@@ -2346,6 +2369,7 @@ class GroundTruthApp(QMainWindow):
         
         # Read ZED SDK filters/settings
         zed_config = {
+            'resolution': self.settings_dialog.cb_zed_resolution.currentData(),
             'depth_mode': self.settings_dialog.cb_zed_depth_mode.currentData(),
             'sensing_mode': self.settings_dialog.cb_zed_sensing_mode.currentData(),
             'confidence': self.settings_dialog.sb_zed_confidence.value(),
