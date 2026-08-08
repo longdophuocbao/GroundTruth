@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import csv
+import json
 from datetime import datetime
 import numpy as np
 import cv2
@@ -68,6 +69,7 @@ class CameraWorker(QThread):
     frame_ready = Signal(np.ndarray, dict) # Emits the annotated BGR/RGB frame and results dictionary
     error_occurred = Signal(str)
     status_msg = Signal(str)
+    calibration_complete = Signal(dict)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -96,6 +98,20 @@ class CameraWorker(QThread):
         self._threshold_max = 4.0
         self._laser_power = 150
         
+        # Reference Map state
+        self._use_ref_map = False
+        self._reference_map = None
+        self._use_imu = True
+        self._filtered_R_A = None
+        self._filtered_P_A = None
+        
+        # Calibration state
+        self._calibration_active = False
+        self._calibration_frames_collected = 0
+        self._calibration_data_p = {}
+        self._calibration_data_r = {}
+        self._calibration_anchor_id = None
+        
         self._trackers = {}
         self._distance_history = []
         self._window_size = 10
@@ -111,7 +127,7 @@ class CameraWorker(QThread):
     def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
                       filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                       enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                      threshold_min, threshold_max, laser_power):
+                      threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu):
         with QMutexLocker(self._mutex):
             self._tag_size = tag_size
             self._source_id = source_id
@@ -130,6 +146,26 @@ class CameraWorker(QThread):
             self._threshold_min = threshold_min
             self._threshold_max = threshold_max
             self._laser_power = laser_power
+            self._use_ref_map = use_ref_map
+            self._reference_map = reference_map
+            self._use_imu = use_imu
+            self._filtered_R_A = None
+            self._filtered_P_A = None
+
+    def start_calibration(self, reset=False):
+        with QMutexLocker(self._mutex):
+            self._calibration_active = True
+            self._calibration_frames_collected = 0
+            self._calibration_data_p = {}
+            self._calibration_data_r = {}
+            
+            # Khởi tạo lại bản đồ nếu yêu cầu làm mới
+            if reset:
+                self._reference_map = None
+                self._calibration_anchor_id = None
+                
+            self._filtered_R_A = None
+            self._filtered_P_A = None
 
     def stop(self):
         self.running = False
@@ -190,12 +226,45 @@ class CameraWorker(QThread):
         config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
         config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
         
+        # Try to enable IMU streams (accel and gyro)
+        enable_imu = True
+        try:
+            config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 200)
+            config.enable_stream(rs.stream.gyro, rs.format.motion_xyz32f, 200)
+        except Exception as imu_err:
+            print(f"Không thể kích hoạt luồng IMU: {imu_err}. Chạy không có IMU.")
+            enable_imu = False
+            
         align = rs.align(rs.stream.color)
         
         try:
-            profile = pipeline.start(config)
+            try:
+                profile = pipeline.start(config)
+            except Exception as start_err:
+                if enable_imu:
+                    # Retry without IMU streams
+                    pipeline = rs.pipeline()
+                    config = rs.config()
+                    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+                    profile = pipeline.start(config)
+                    enable_imu = False
+                    self.status_msg.emit("Khởi động camera thành công (Đã bỏ qua luồng IMU).")
+                else:
+                    raise start_err
+                    
             device = profile.get_device()
             depth_sensor = device.first_depth_sensor()
+            # --- CẤU HÌNH TỐI ƯU NGOÀI TRỜI ---                                                                
+            if depth_sensor:                                                                                    
+                # 1. Tắt Emitter để tránh nhiễu ánh sáng mặt trời                                               
+                if depth_sensor.supports(rs.option.emitter_enabled):                                            
+                    depth_sensor.set_option(rs.option.emitter_enabled, 0.0)                                     
+                                                                                                                
+                # 2. Đặt Preset về High Accuracy (3) hoặc Remove IR Pattern (6)                                 
+                if depth_sensor.supports(rs.option.visual_preset):                                              
+                    depth_sensor.set_option(rs.option.visual_preset, 3)                                         
+            # ----------------------------------                     
             self.status_msg.emit("Đang kết nối. Pipeline bắt đầu hoạt động.")
         except Exception as e:
             self.error_occurred.emit(f"Không thể khởi động camera: {str(e)}")
@@ -238,6 +307,9 @@ class CameraWorker(QThread):
             # Reset trackers and history
             self._trackers = {}
             self._distance_history.clear()
+            self._filtered_R_A = None
+            self._filtered_P_A = None
+            last_time = time.time()
             
             while self.running:
                 frames = pipeline.wait_for_frames()
@@ -249,6 +321,23 @@ class CameraWorker(QThread):
                 
                 if not color_frame or not depth_frame:
                     continue
+                    
+                # Get IMU data if enabled
+                gyro_data = None
+                if enable_imu:
+                    try:
+                        gyro_frame = frames.first_or_default(rs.stream.gyro)
+                        if gyro_frame:
+                            motion_data = gyro_frame.as_motion_frame().get_motion_data()
+                            gyro_data = [motion_data.x, motion_data.y, motion_data.z]
+                    except Exception:
+                        pass
+                        
+                current_time = time.time()
+                dt = current_time - last_time
+                last_time = current_time
+                if dt <= 0 or dt > 0.5:
+                    dt = 0.033
                     
                 # Convert frames to numpy arrays
                 color_image = np.asanyarray(color_frame.get_data()).copy()
@@ -272,6 +361,9 @@ class CameraWorker(QThread):
                     threshold_min = self._threshold_min
                     threshold_max = self._threshold_max
                     laser_power = self._laser_power
+                    use_ref_map = self._use_ref_map
+                    reference_map = self._reference_map
+                    use_imu = self._use_imu
                 
                 # Apply Laser Power dynamically
                 if depth_sensor and depth_sensor.supports(rs.option.laser_power):
@@ -424,6 +516,235 @@ class CameraWorker(QThread):
                         'pos_depth': pos_depth,
                         'lost_frames': tracker.lost_frames
                     }
+                
+                # 1. Reference Map Calibration Accumulation (Cuốn Chiếu)
+                if self._calibration_active:
+                    if target_ids_str.strip() == "":
+                        target_ids = [tid for tid in sorted(active_tags.keys()) if tid != source_id]
+                    else:
+                        try:
+                            parsed_ids = [int(x.strip()) for x in target_ids_str.split(",") if x.strip().isdigit()]
+                            target_ids = [tid for tid in parsed_ids if tid in active_tags]
+                        except Exception:
+                            target_ids = [tid for tid in sorted(active_tags.keys()) if tid != source_id]
+                            
+                    detected_targets = [tid for tid in target_ids if tid in active_tags and not active_tags[tid]['lost_frames'] > 0]
+                    if len(detected_targets) > 0:
+                        # Dùng tag đầu tiên quét được làm mỏ neo tạm thời cho bản đồ cục bộ
+                        temp_anchor = detected_targets[0]
+                        
+                        if temp_anchor in active_tags and active_tags[temp_anchor]['rvec'] is not None:
+                            anchor_tag = active_tags[temp_anchor]
+                            pos_a = anchor_tag['pos_pnp'] if coord_mode == 'pnp' else anchor_tag['pos_depth']
+                            R_a, _ = cv2.Rodrigues(anchor_tag['rvec'])
+                            
+                            for tid in detected_targets:
+                                tag = active_tags[tid]
+                                if tag['rvec'] is not None:
+                                    pos_t = tag['pos_pnp'] if coord_mode == 'pnp' else tag['pos_depth']
+                                    R_t, _ = cv2.Rodrigues(tag['rvec'])
+                                    
+                                    # Tính toán tọa độ cục bộ (Local coordinates)
+                                    p_local = R_a.T @ (pos_t - pos_a)
+                                    r_local = R_a.T @ R_t
+                                    
+                                    if tid not in self._calibration_data_p:
+                                        self._calibration_data_p[tid] = []
+                                        self._calibration_data_r[tid] = []
+                                    self._calibration_data_p[tid].append(p_local)
+                                    self._calibration_data_r[tid].append(r_local)
+                                    
+                            self._calibration_frames_collected += 1
+                            self.status_msg.emit(f"Đang quét bản đồ cục bộ... Khung hình {self._calibration_frames_collected}/60")
+                            
+                            if self._calibration_frames_collected >= 60:
+                                local_map = {}
+                                for tid, plist in self._calibration_data_p.items():
+                                    if len(plist) > 0:
+                                        p_avg = np.mean(plist, axis=0)
+                                        rlist = self._calibration_data_r[tid]
+                                        M = np.mean(rlist, axis=0)
+                                        U, S, Vt = np.linalg.svd(M)
+                                        r_avg = U @ Vt
+                                        if np.linalg.det(r_avg) < 0:
+                                            r_avg = U @ np.diag([1.0, 1.0, -1.0]) @ Vt
+                                            
+                                        local_map[str(tid)] = {
+                                            'p_local': p_avg.tolist(),
+                                            'r_local': r_avg.tolist()
+                                        }
+                                        
+                                # LƯU TRỮ VÀ GHÉP BẢN ĐỒ (MAP STITCHING)
+                                if getattr(self, '_reference_map', None) is None:
+                                    self._reference_map = {}
+                                    
+                                if not self._reference_map:
+                                    # Nếu bản đồ tổng trống, lấy bản đồ cục bộ làm bản đồ tổng
+                                    self._reference_map = local_map
+                                    self._calibration_anchor_id = temp_anchor
+                                else:
+                                    # Tìm các tag trùng lặp giữa bản đồ hiện tại và bản đồ tổng
+                                    common_ids = [tid for tid in local_map.keys() if tid in self._reference_map.keys()]
+                                    
+                                    if len(common_ids) > 0:
+                                        # Tính ma trận chuyển đổi từ Local Map sang Global Map
+                                        if len(common_ids) >= 3:
+                                            # Dùng thuật toán Kabsch nếu có từ 3 tag trùng trở lên (chính xác nhất)
+                                            P_global = [self._reference_map[cid]['p_local'] for cid in common_ids]
+                                            Q_local = [local_map[cid]['p_local'] for cid in common_ids]
+                                            R_L2G, T_L2G = self._kabsch_alignment(np.array(Q_local), np.array(P_global))
+                                        else:
+                                            # Dùng 1 hoặc 2 tag trùng lặp (Dựa vào thông tin Rotation của AprilTag)
+                                            cid = common_ids[0]
+                                            p_g = np.array(self._reference_map[cid]['p_local'])
+                                            R_g = np.array(self._reference_map[cid]['r_local'])
+                                            p_l = np.array(local_map[cid]['p_local'])
+                                            R_l = np.array(local_map[cid]['r_local'])
+                                            
+                                            R_L2G = R_g @ R_l.T
+                                            T_L2G = p_g - R_L2G @ p_l
+                                            
+                                        # Biến đổi các tag MỚI từ Local sang Global và thêm vào Reference Map
+                                        for tid, data in local_map.items():
+                                            if tid not in self._reference_map:
+                                                p_l_new = np.array(data['p_local'])
+                                                R_l_new = np.array(data['r_local'])
+                                                
+                                                p_g_new = R_L2G @ p_l_new + T_L2G
+                                                R_g_new = R_L2G @ R_l_new
+                                                
+                                                self._reference_map[tid] = {
+                                                    'p_local': p_g_new.tolist(),
+                                                    'r_local': R_g_new.tolist()
+                                                }
+                                    else:
+                                        self.status_msg.emit("Không tìm thấy tag trùng lặp! Không thể nối bản đồ.")
+                                        self._calibration_active = False
+                                        continue
+
+                                calibration_result = {
+                                    'anchor_id': int(self._calibration_anchor_id) if getattr(self, '_calibration_anchor_id', None) else int(temp_anchor),
+                                    'map': self._reference_map
+                                }
+                                self.calibration_complete.emit(calibration_result)
+                                self._calibration_active = False
+                                self.status_msg.emit(f"Cập nhật thành công! Tổng cộng {len(self._reference_map)} Tag trong bản đồ.")
+                
+                # 2. Reference Map Optimization & Virtual Tag Reconstruction (Handheld Mode with IMU complementary filter)
+                if use_ref_map and reference_map is not None:
+                    detected_mapped_ids = []
+                    for tid_str, ref_data in reference_map.items():
+                        tid = int(tid_str)
+                        if tid in active_tags and not active_tags[tid]['lost_frames'] > 0:
+                            if active_tags[tid]['rvec'] is not None:
+                                detected_mapped_ids.append(tid)
+                                
+                    if len(detected_mapped_ids) > 0:
+                        # 1. Estimate measured pose
+                        if len(detected_mapped_ids) >= 3:
+                            P_pts = []
+                            Q_pts = []
+                            for tid in detected_mapped_ids:
+                                ref_data = reference_map[str(tid)]
+                                P_pts.append(ref_data['p_local'])
+                                tag = active_tags[tid]
+                                pos_t = tag['pos_pnp'] if coord_mode == 'pnp' else tag['pos_depth']
+                                Q_pts.append(pos_t)
+                                
+                            R_A_meas, P_A_meas = self._kabsch_alignment(np.array(P_pts), np.array(Q_pts))
+                        else:
+                            tid = detected_mapped_ids[0]
+                            tag = active_tags[tid]
+                            pos_t = tag['pos_pnp'] if coord_mode == 'pnp' else tag['pos_depth']
+                            R_t, _ = cv2.Rodrigues(tag['rvec'])
+                            
+                            ref_data = reference_map[str(tid)]
+                            p_local = np.array(ref_data['p_local'])
+                            r_local = np.array(ref_data['r_local'])
+                            
+                            R_A_meas = R_t @ r_local.T
+                            P_A_meas = pos_t - R_A_meas @ p_local
+                            
+                        # 2. IMU complementary filter / temporal fusion
+                        if self._filtered_R_A is None:
+                            self._filtered_R_A = R_A_meas
+                            self._filtered_P_A = P_A_meas
+                        else:
+                            # Apply IMU gyro prediction if available and enabled
+                            if use_imu and gyro_data is not None:
+                                w = np.array(gyro_data)
+                                theta = np.linalg.norm(w) * dt
+                                if theta > 1e-5:
+                                    axis = w / np.linalg.norm(w)
+                                    rvec_gyro = axis * theta
+                                    dR, _ = cv2.Rodrigues(rvec_gyro)
+                                    R_pred = dR @ self._filtered_R_A
+                                    P_pred = dR @ self._filtered_P_A
+                                else:
+                                    R_pred = self._filtered_R_A
+                                    P_pred = self._filtered_P_A
+                            else:
+                                R_pred = self._filtered_R_A
+                                P_pred = self._filtered_P_A
+                                
+                            # Fusion weights
+                            alpha_rot = 0.9   # responsive rotation
+                            alpha_trans = 0.9 # responsive translation
+                            
+                            # Fuse translations
+                            self._filtered_P_A = (1 - alpha_trans) * P_pred + alpha_trans * P_A_meas
+                            
+                            # Fuse rotations using SVD
+                            M_R = (1 - alpha_rot) * R_pred + alpha_rot * R_A_meas
+                            U, S, Vt = np.linalg.svd(M_R)
+                            R_smooth = U @ Vt
+                            if np.linalg.det(R_smooth) < 0:
+                                R_smooth = U @ np.diag([1.0, 1.0, -1.0]) @ Vt
+                            self._filtered_R_A = R_smooth
+                            
+                        R_A_opt = self._filtered_R_A
+                        P_A_opt = self._filtered_P_A
+                        
+                        # 3. Reconstruct all tags in the reference map
+                        for tid_str, ref_data in reference_map.items():
+                            tid = int(tid_str)
+                            p_local = np.array(ref_data['p_local'])
+                            r_local = np.array(ref_data['r_local'])
+                            
+                            pos_reconstructed = R_A_opt @ p_local + P_A_opt
+                            R_reconstructed = R_A_opt @ r_local
+                            rvec_reconstructed, _ = cv2.Rodrigues(R_reconstructed)
+                            
+                            if tid in active_tags:
+                                active_tags[tid]['pos_pnp'] = pos_reconstructed
+                                active_tags[tid]['pos_depth'] = pos_reconstructed
+                                active_tags[tid]['rvec'] = rvec_reconstructed
+                                active_tags[tid]['tvec'] = pos_reconstructed.reshape(3, 1)
+                            else:
+                                s = tag_size
+                                local_corners = np.array([
+                                    [-s/2, -s/2, 0],
+                                    [ s/2, -s/2, 0],
+                                    [ s/2,  s/2, 0],
+                                    [-s/2,  s/2, 0]
+                                ], dtype=np.float32)
+                                cam_corners = (R_reconstructed @ local_corners.T).T + pos_reconstructed
+                                pts_2d = self._project_points_3d_to_2d(cam_corners, cam_matrix, dist_coeffs)
+                                
+                                active_tags[tid] = {
+                                    'corners': pts_2d,
+                                    'center_2d': (float(np.mean(pts_2d[:, 0])), float(np.mean(pts_2d[:, 1]))),
+                                    'rvec': rvec_reconstructed,
+                                    'tvec': pos_reconstructed.reshape(3, 1),
+                                    'pos_pnp': pos_reconstructed,
+                                    'pos_depth': pos_reconstructed,
+                                    'lost_frames': 1,
+                                    'is_virtual': True
+                                }
+                    else:
+                        # Reset filter if no tags are detected
+                        self._filtered_R_A = None
+                        self._filtered_P_A = None
                 
                 # Process measurements
                 results = {
@@ -639,6 +960,28 @@ class CameraWorker(QThread):
             # Fallback to segment in case SVD has issues
             return self._distance_point_to_segment(p, qs[0], qs[-1])
 
+    def _kabsch_alignment(self, P, Q):
+        """
+        Finds the optimal rotation R and translation T such that R @ P_i + T approx = Q_i.
+        P: shape (N, 3) - reference points (local coordinates)
+        Q: shape (N, 3) - detected points (camera coordinates)
+        """
+        centroid_P = np.mean(P, axis=0)
+        centroid_Q = np.mean(Q, axis=0)
+        
+        P_centered = P - centroid_P
+        Q_centered = Q - centroid_Q
+        
+        H = P_centered.T @ Q_centered
+        U, S, Vt = np.linalg.svd(H)
+        R = Vt.T @ U.T
+        if np.linalg.det(R) < 0:
+            Vt[2, :] *= -1
+            R = Vt.T @ U.T
+            
+        T = centroid_Q - R @ centroid_P
+        return R, T
+
     # Drawing helpers
     def _project_points_3d_to_2d(self, pts_3d, cam_matrix, dist_coeffs):
         pts_3d = np.array(pts_3d, dtype=np.float32).reshape(-1, 3)
@@ -685,7 +1028,7 @@ class CameraWorker(QThread):
                 cv2.fillPoly(overlay, [pts_2d_int], (255, 128, 0))
                 
             # Alpha blending: 0.4 opacity (60% transparency)
-            alpha = 0.4
+            alpha = 0.6
             cv2.addWeighted(overlay, alpha, image, 1.0 - alpha, 0, image)
         
         # 2. Draw even boundary line (yellow)
@@ -977,11 +1320,25 @@ class GroundTruthApp(QMainWindow):
         # Initialize settings dialog
         self.settings_dialog = SettingsDialog(self)
         
+        # Reference Map state
+        self.reference_map = None
+        self.reference_anchor_id = None
+        ref_map_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_map.json")
+        if os.path.exists(ref_map_path):
+            try:
+                with open(ref_map_path, "r", encoding="utf-8") as f:
+                    ref_data = json.load(f)
+                    self.reference_map = ref_data.get('map')
+                    self.reference_anchor_id = ref_data.get('anchor_id')
+            except Exception as e:
+                print(f"Lỗi tải reference_map.json: {e}")
+        
         # Initialize thread
         self.worker = CameraWorker()
         self.worker.frame_ready.connect(self.update_frame)
         self.worker.error_occurred.connect(self.handle_camera_error)
         self.worker.status_msg.connect(self.update_status)
+        self.worker.calibration_complete.connect(self.on_calibration_complete)
         
         # Plot data history
         self.plot_time_history = []
@@ -1049,10 +1406,10 @@ class GroundTruthApp(QMainWindow):
         # Real-time Plot Widget using pyqtgraph
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('#1a1a1a')
-        self.plot_widget.setTitle("ĐỒ THỊ KHOẢNG CÁCH THEO THỜI GIAN (MM)", color='#00e5ff', size='10pt')
-        self.plot_widget.setLabel('left', 'Khoảng cách', units='mm', color='#d1d1d1')
-        self.plot_widget.setLabel('bottom', 'Thời gian', units='s', color='#d1d1d1')
-        self.plot_widget.setYRange(100, 400, padding=0)
+        self.plot_widget.setTitle("Depth(MM)", color='#00e5ff', size='10pt')
+        self.plot_widget.setLabel('left', 'Depth', units='mm', color='#d1d1d1')
+        self.plot_widget.setLabel('bottom', 'Time', units='s', color='#d1d1d1')
+        self.plot_widget.setYRange(200, 500, padding=0)
         self.plot_widget.showGrid(x=True, y=True, alpha=0.15)
         
         # Plot curve
@@ -1098,6 +1455,43 @@ class GroundTruthApp(QMainWindow):
         self.chk_show_depth.setChecked(False)
         self.chk_show_depth.stateChanged.connect(self.toggle_depth_visibility)
         stream_grid.addWidget(self.chk_show_depth, 2, 0, 1, 2)
+        
+        # Checkbox for using reference map
+        self.chk_use_ref_map = QCheckBox("Sử dụng bản đồ tham chiếu (Giảm nhiễu)")
+        self.chk_use_ref_map.setChecked(False)
+        self.chk_use_ref_map.setEnabled(False)
+        self.chk_use_ref_map.stateChanged.connect(self.push_config_to_worker)
+        stream_grid.addWidget(self.chk_use_ref_map, 3, 0, 1, 2)
+        
+        # Checkbox for using IMU fusion
+        self.chk_use_imu = QCheckBox("Sử dụng cảm biến IMU (D455)")
+        self.chk_use_imu.setChecked(True)
+        self.chk_use_imu.stateChanged.connect(self.push_config_to_worker)
+        stream_grid.addWidget(self.chk_use_imu, 4, 0, 1, 2)
+        
+        # Button to reset/start new map
+        self.btn_reset_map = QPushButton("Tạo bản đồ mới (Xóa dữ liệu cũ)")
+        self.btn_reset_map.setObjectName("btn_stop")
+        self.btn_reset_map.setEnabled(False)
+        self.btn_reset_map.clicked.connect(self.reset_map_calibration)
+        stream_grid.addWidget(self.btn_reset_map, 5, 0, 1, 2)
+        
+        # Button to append to map (Cuốn chiếu)
+        self.btn_calibrate_map = QPushButton("Quét & Nối Tag (Cuốn chiếu)")
+        self.btn_calibrate_map.setObjectName("btn_normal")
+        self.btn_calibrate_map.setEnabled(False)
+        self.btn_calibrate_map.clicked.connect(self.start_map_calibration)
+        stream_grid.addWidget(self.btn_calibrate_map, 6, 0, 1, 2)
+
+        self.btn_save_map = QPushButton("Lưu file (Save)")
+        self.btn_save_map.setObjectName("btn_normal")
+        self.btn_save_map.clicked.connect(self.save_map_file)
+        stream_grid.addWidget(self.btn_save_map, 7, 0, 1, 1)
+        
+        self.btn_load_map = QPushButton("Tải file (Load)")
+        self.btn_load_map.setObjectName("btn_normal")
+        self.btn_load_map.clicked.connect(self.load_map_file)
+        stream_grid.addWidget(self.btn_load_map, 7, 1, 1, 1)
         
         right_layout.addWidget(stream_group)
         
@@ -1154,6 +1548,11 @@ class GroundTruthApp(QMainWindow):
         right_layout.addWidget(logger_group)
         
         main_layout.addLayout(right_layout, 1)
+        
+        # Load reference map if exists
+        if self.reference_map is not None:
+            self.chk_use_ref_map.setEnabled(True)
+            self.chk_use_ref_map.setChecked(True)
 
     def show_settings_dialog(self):
         self.settings_dialog.exec()
@@ -1334,11 +1733,14 @@ class GroundTruthApp(QMainWindow):
         threshold_min = self.settings_dialog.sb_threshold_min.value()
         threshold_max = self.settings_dialog.sb_threshold_max.value()
         laser_power = self.settings_dialog.sb_laser_power.value()
+        use_ref_map = self.chk_use_ref_map.isChecked()
+        reference_map = self.reference_map
+        use_imu = self.chk_use_imu.isChecked()
         
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                                   enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                                  threshold_min, threshold_max, laser_power)
+                                  threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu)
         
     def scan_devices(self):
         self.status_bar_lbl.setText("Đang quét thiết bị camera...")
@@ -1393,6 +1795,7 @@ class GroundTruthApp(QMainWindow):
         self.btn_toggle_stream.style().polish(self.btn_toggle_stream)
         self.btn_scan.setEnabled(False)
         self.settings_dialog.sb_source_id.setEnabled(False)
+        self.btn_calibrate_map.setEnabled(True)
         
         # Reset FPS calculation variables
         self.fps_timer = time.time()
@@ -1423,10 +1826,93 @@ class GroundTruthApp(QMainWindow):
         self.btn_toggle_stream.style().polish(self.btn_toggle_stream)
         self.btn_scan.setEnabled(True)
         self.settings_dialog.sb_source_id.setEnabled(True)
+        self.btn_calibrate_map.setEnabled(False)
         
         # Reset FPS
         self.fps_lbl.setText("FPS: N/A")
         self.fps_counter = 0
+        
+    def reset_map_calibration(self):
+        self.worker.start_calibration(reset=True)
+        self.status_bar_lbl.setText("Đã xóa bản đồ cũ trong bộ nhớ. Vui lòng nhấn 'Quét & Nối Tag' để bắt đầu tạo mốc mới.")
+        
+    def start_map_calibration(self):
+        self.worker.start_calibration(reset=False)
+        self.status_bar_lbl.setText("Đang quét và tính toán nội suy... Vui lòng giữ yên camera!")
+
+    def save_map_file(self):
+        if not self.reference_map:
+            QMessageBox.warning(self, "Lưu bản đồ", "Hiện chưa có bản đồ nào trong bộ nhớ để lưu!")
+            return
+            
+        # Tạo tên file mặc định dựa trên thời gian thực
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"reference_map_{timestamp}.json"
+        default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), default_name)
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Lưu file Bản đồ", default_path, "JSON Files (*.json)"
+        )
+        
+        if file_path:
+            try:
+                result = {
+                    'anchor_id': self.reference_anchor_id,
+                    'map': self.reference_map
+                }
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(result, f, indent=4)
+                self.status_bar_lbl.setText(f"Đã lưu bản đồ thành công tại: {os.path.basename(file_path)}")
+                QMessageBox.information(self, "Thành công", f"Đã lưu bản đồ vào file:\n{os.path.basename(file_path)}")
+            except Exception as e:
+                QMessageBox.critical(self, "Lỗi", f"Không thể lưu file: {str(e)}")
+
+    def load_map_file(self):
+        default_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Chọn file Bản đồ", default_dir, "JSON Files (*.json)"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    ref_data = json.load(f)
+                    
+                    if 'map' not in ref_data:
+                        raise ValueError("File không đúng định dạng bản đồ Reference Map!")
+                        
+                    self.reference_map = ref_data.get('map')
+                    self.reference_anchor_id = ref_data.get('anchor_id')
+                    
+                self.chk_use_ref_map.setEnabled(True)
+                self.chk_use_ref_map.setChecked(True)
+                self.push_config_to_worker()
+                
+                self.status_bar_lbl.setText(f"Đã tải bản đồ: {os.path.basename(file_path)} (Anchor ID: {self.reference_anchor_id})")
+                QMessageBox.information(self, "Thành công", f"Đã tải bản đồ chứa {len(self.reference_map)} Tag thành công.")
+            except Exception as e:
+                QMessageBox.critical(self, "Lỗi", f"Không thể đọc file: {str(e)}")
+
+    def on_calibration_complete(self, result):
+        self.reference_map = result['map']
+        self.reference_anchor_id = result['anchor_id']
+        
+        # Đổi cơ chế lưu tự động: Luôn đính kèm thời gian (Timestamp) để chống mất dữ liệu do nhấn nhầm
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"reference_map_autosave_{timestamp}.json"
+        ref_map_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        
+        try:
+            with open(ref_map_path, "w", encoding="utf-8") as f:
+                json.dump(result, f, indent=4)
+            self.status_bar_lbl.setText(f"Cập nhật bản đồ xong! Đã tự động sao lưu tại: {filename}")
+        except Exception as e:
+            self.status_bar_lbl.setText("Cập nhật bản đồ xong nhưng bị lỗi khi tự động lưu file.")
+            QMessageBox.warning(self, "Lỗi tự động lưu", f"Không thể tự động lưu bản đồ: {e}")
+            
+        self.chk_use_ref_map.setEnabled(True)
+        self.chk_use_ref_map.setChecked(True)
+        self.push_config_to_worker()
         
     def toggle_depth_visibility(self, state):
         if state == Qt.Checked.value or state is True:
