@@ -1581,11 +1581,16 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Cài Đặt Tham Số Hệ Thống")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(950)
         self.init_ui(parent)
         
     def init_ui(self, parent):
         layout = QVBoxLayout(self)
+        
+        # Main content layout split into two columns
+        content_layout = QHBoxLayout()
+        left_col = QVBoxLayout()
+        right_col = QVBoxLayout()
         
         # 1. Config parameters group
         config_group = QGroupBox("CẤU HÌNH PHÁT HIỆN & THỐNG KÊ")
@@ -1619,7 +1624,7 @@ class SettingsDialog(QDialog):
         self.cb_coord_mode.addItem("Sử dụng SolvePnP hình học", "pnp")
         config_grid.addWidget(self.cb_coord_mode, 3, 1)
         
-        layout.addWidget(config_group)
+        left_col.addWidget(config_group)
         
         # 2. Tracking & Filtering configuration
         tracking_group = QGroupBox("BÁM VẾT & BỘ LỌC MƯỢT 3D (TRACKING)")
@@ -1652,7 +1657,8 @@ class SettingsDialog(QDialog):
         self.sb_window_size.setValue(10) # default window size of 10 frames (highly responsive)
         tracking_grid.addWidget(self.sb_window_size, 4, 1)
         
-        layout.addWidget(tracking_group)
+        left_col.addWidget(tracking_group)
+        left_col.addStretch()
         
         # 2.5 RealSense SDK Post-Processing filters
         self.realsense_group = QGroupBox("BỘ LỌC CHIỀU SÂU REALSENSE (POST-PROCESSING)")
@@ -1700,7 +1706,7 @@ class SettingsDialog(QDialog):
         self.sb_laser_power.setSuffix(" mW")
         realsense_grid.addWidget(self.sb_laser_power, 5, 1)
         
-        layout.addWidget(self.realsense_group)
+        right_col.addWidget(self.realsense_group)
         
         # 2.6 ZED SDK Depth Configuration
         self.zed_sdk_group = QGroupBox("CẤU HÌNH CHIỀU SÂU ZED SDK (CUDA)")
@@ -1761,7 +1767,7 @@ class SettingsDialog(QDialog):
         self.sb_zed_depth_max.setSingleStep(0.5)
         zed_grid.addWidget(self.sb_zed_depth_max, 6, 1)
         
-        layout.addWidget(self.zed_sdk_group)
+        right_col.addWidget(self.zed_sdk_group)
         
         # 2.7 ZED UVC Info
         self.zed_uvc_group = QGroupBox("THÔNG TIN ZED UVC")
@@ -1770,7 +1776,13 @@ class SettingsDialog(QDialog):
         self.lbl_zed_uvc_info.setStyleSheet("color: #ffb74d;")
         self.lbl_zed_uvc_info.setWordWrap(True)
         zed_uvc_layout.addWidget(self.lbl_zed_uvc_info)
-        layout.addWidget(self.zed_uvc_group)
+        right_col.addWidget(self.zed_uvc_group)
+        right_col.addStretch()
+        
+        # Add columns to content layout
+        content_layout.addLayout(left_col, 1)
+        content_layout.addLayout(right_col, 1)
+        layout.addLayout(content_layout)
         
         # 3. Dialog buttons
         buttons_layout = QHBoxLayout()
