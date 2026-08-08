@@ -58,13 +58,13 @@ import cv2
 import pyrealsense2 as rs
 import pyqtgraph as pg
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex, QMutexLocker
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QMutex, QMutexLocker, QEvent
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
                              QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, 
                              QGroupBox, QComboBox, QFileDialog, QMessageBox, QCheckBox,
-                             QDoubleSpinBox, QSpinBox, QDialog)
-from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QIcon
+                             QDoubleSpinBox, QSpinBox, QDialog, QToolTip)
+from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QIcon, QCursor
 
 class BaseCameraDevice:
     def open(self):
@@ -92,6 +92,7 @@ class RealSenseCameraDevice(BaseCameraDevice):
         self.align = None
         self.profile = None
         self.depth_sensor = None
+        self.depth_scale = 0.001
         self.enable_imu = False
         
         # RealSense Filters
@@ -144,6 +145,7 @@ class RealSenseCameraDevice(BaseCameraDevice):
             device = self.profile.get_device()
             self.depth_sensor = device.first_depth_sensor()
             if self.depth_sensor:
+                self.depth_scale = self.depth_sensor.get_depth_scale()
                 if self.depth_sensor.supports(rs.option.emitter_enabled):
                     self.depth_sensor.set_option(rs.option.emitter_enabled, 0.0)
                 if self.depth_sensor.supports(rs.option.visual_preset):
@@ -1252,8 +1254,22 @@ class CameraWorker(QThread):
                     
                     # Draw 3D axis
                     if not is_lost and tag['rvec'] is not None and tag['tvec'] is not None:
-                        cv2.drawFrameAxes(color_image, cam_matrix, dist_coeffs, 
-                                          tag['rvec'], tag['tvec'], length=tag_size * 0.5, thickness=2)
+                        # Check if the projected axis endpoints are within the image frame to avoid warnings
+                        axis_len = tag_size * 0.5
+                        axis_points = np.array([[0, 0, 0], [axis_len, 0, 0], [0, axis_len, 0], [0, 0, axis_len]], dtype=np.float32)
+                        img_pts, _ = cv2.projectPoints(axis_points, tag['rvec'], tag['tvec'], cam_matrix, dist_coeffs)
+                        img_pts = img_pts.reshape(-1, 2)
+                        
+                        h_img, w_img = color_image.shape[:2]
+                        in_frame = True
+                        for pt in img_pts:
+                            if not (0 <= pt[0] < w_img and 0 <= pt[1] < h_img):
+                                in_frame = False
+                                break
+                                
+                        if in_frame:
+                            cv2.drawFrameAxes(color_image, cam_matrix, dist_coeffs, 
+                                              tag['rvec'], tag['tvec'], length=axis_len, thickness=2)
                 
                 # Compute distance to plane of targets if source and targets are detected
                 if source_pos is not None and len(target_pts) > 0:
@@ -1291,14 +1307,21 @@ class CameraWorker(QThread):
                     self._write_log_row(results, source_id, source_pos, target_ids)
                 
                 # Generate colorized depth image to send to GUI
+                depth_matrix_m = None
                 if depth_frame is not None:
                     try:
                         depth_image = camera.get_colorized_depth(depth_frame)
+                        if hasattr(depth_frame, 'depth_matrix'):
+                            depth_matrix_m = depth_frame.depth_matrix.copy()
+                        else:
+                            scale = getattr(camera, 'depth_scale', 0.001)
+                            depth_matrix_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * scale
                     except Exception:
                         depth_image = None
                 else:
                     depth_image = None
                 results['depth_image'] = depth_image
+                results['depth_matrix_m'] = depth_matrix_m
                 
                 # Send frame and results to GUI
                 self.frame_ready.emit(color_image, results)
@@ -1752,11 +1775,19 @@ class SettingsDialog(QDialog):
                 font-size: 12px;
                 text-transform: uppercase;
             }
-            QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+            QLineEdit, QComboBox {
                 background-color: #2c2c2c;
                 border: 1px solid #3c3c3c;
                 border-radius: 4px;
                 padding: 5px;
+                color: #ffffff;
+            }
+            QDoubleSpinBox, QSpinBox {
+                background-color: #2c2c2c;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 5px;
+                padding-right: 20px;
                 color: #ffffff;
             }
             QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {
@@ -1885,6 +1916,9 @@ class GroundTruthApp(QMainWindow):
         self.fps_timer = time.time()
         self.fps_counter = 0
         
+        # Depth hovering data
+        self.current_depth_matrix = None
+        
         self.init_ui()
         self.apply_stylesheet()
         
@@ -1934,6 +1968,8 @@ class GroundTruthApp(QMainWindow):
         self.depth_label.setObjectName("lbl_video")
         self.depth_label.setMinimumSize(480, 360)
         self.depth_label.setVisible(False) # Default hidden
+        self.depth_label.setMouseTracking(True)
+        self.depth_label.installEventFilter(self)
         self.camera_layout.addWidget(self.depth_label)
         
         left_layout.addWidget(self.camera_container, 3) # Stretch factor 3
@@ -2155,11 +2191,20 @@ class GroundTruthApp(QMainWindow):
             text-transform: uppercase;
         }
         
-        QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox {
+        QLineEdit, QComboBox {
             background-color: #2c2c2c;
             border: 1px solid #3c3c3c;
             border-radius: 4px;
             padding: 5px;
+            color: #ffffff;
+        }
+        
+        QDoubleSpinBox, QSpinBox {
+            background-color: #2c2c2c;
+            border: 1px solid #3c3c3c;
+            border-radius: 4px;
+            padding: 5px;
+            padding-right: 20px;
             color: #ffffff;
         }
         
@@ -2689,6 +2734,9 @@ class GroundTruthApp(QMainWindow):
             dpixmap = QPixmap.fromImage(dq_image)
             dscaled_pixmap = dpixmap.scaled(self.depth_label.size(), Qt.KeepAspectRatio, Qt.FastTransformation)
             self.depth_label.setPixmap(dscaled_pixmap)
+            self.current_depth_matrix = results.get('depth_matrix_m', None)
+        else:
+            self.current_depth_matrix = None
         
         # Update real-time plot
         if self.plot_start_time is None:
@@ -2749,6 +2797,40 @@ class GroundTruthApp(QMainWindow):
             self.table_tags.setItem(idx, 3, item_x)
             self.table_tags.setItem(idx, 4, item_y)
             self.table_tags.setItem(idx, 5, item_z)
+
+    def eventFilter(self, watched, event):
+        if watched == self.depth_label and event.type() == QEvent.MouseMove:
+            if self.current_depth_matrix is not None:
+                orig_h, orig_w = self.current_depth_matrix.shape[:2]
+                widget_w = self.depth_label.width()
+                widget_h = self.depth_label.height()
+                if orig_w > 0 and orig_h > 0 and widget_w > 0 and widget_h > 0:
+                    scale = min(widget_w / orig_w, widget_h / orig_h)
+                    new_w = orig_w * scale
+                    new_h = orig_h * scale
+                    dx = (widget_w - new_w) / 2.0
+                    dy = (widget_h - new_h) / 2.0
+                    x_widget = event.pos().x()
+                    y_widget = event.pos().y()
+                    x_image = x_widget - dx
+                    y_image = y_widget - dy
+                    if 0 <= x_image < new_w and 0 <= y_image < new_h:
+                        x_pixel = int(x_image / scale)
+                        y_pixel = int(y_image / scale)
+                        x_pixel = max(0, min(x_pixel, orig_w - 1))
+                        y_pixel = max(0, min(y_pixel, orig_h - 1))
+                        depth_val = self.current_depth_matrix[y_pixel, x_pixel]
+                        if not np.isnan(depth_val) and not np.isinf(depth_val) and depth_val > 0.0:
+                            depth_mm = depth_val * 1000.0
+                            tooltip_text = f"Tọa độ: ({x_pixel}, {y_pixel})\nĐộ sâu: {depth_mm:.0f} mm ({depth_val:.3f} m)"
+                        else:
+                            tooltip_text = f"Tọa độ: ({x_pixel}, {y_pixel})\nĐộ sâu: N/A (Không có dữ liệu)"
+                        QToolTip.showText(QCursor.pos(), tooltip_text, self.depth_label)
+                    else:
+                        QToolTip.hideText()
+            else:
+                QToolTip.hideText()
+        return super().eventFilter(watched, event)
 
     @Slot(str)
     def handle_camera_error(self, error_msg):
