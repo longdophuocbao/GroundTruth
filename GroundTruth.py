@@ -2675,11 +2675,30 @@ class GroundTruthApp(QMainWindow):
                 with open(file_path, "r", encoding="utf-8") as f:
                     ref_data = json.load(f)
                     
-                    if 'map' not in ref_data:
-                        raise ValueError("File không đúng định dạng bản đồ Reference Map!")
+                    if not isinstance(ref_data, dict):
+                        raise ValueError("File JSON không chứa dữ liệu dạng đối tượng (dict)!")
                         
-                    self.reference_map = ref_data.get('map')
-                    self.reference_anchor_id = ref_data.get('anchor_id')
+                    if 'map' in ref_data:
+                        self.reference_map = ref_data.get('map')
+                        self.reference_anchor_id = ref_data.get('anchor_id')
+                    else:
+                        # Tương thích ngược: file định dạng cũ chứa trực tiếp danh sách tag
+                        self.reference_map = ref_data
+                        # Tự động tìm tag có tọa độ [0.0, 0.0, 0.0] làm mỏ neo
+                        self.reference_anchor_id = None
+                        for tid_str, data in ref_data.items():
+                            if isinstance(data, dict) and 'p_local' in data:
+                                p = data['p_local']
+                                if len(p) >= 3 and abs(p[0]) < 1e-5 and abs(p[1]) < 1e-5 and abs(p[2]) < 1e-5:
+                                    self.reference_anchor_id = int(tid_str)
+                                    break
+                        if self.reference_anchor_id is None and len(ref_data) > 0:
+                            # Fallback lấy tag đầu tiên làm mỏ neo nếu không tìm thấy tag [0,0,0]
+                            try:
+                                self.reference_anchor_id = int(next(iter(ref_data.keys())))
+                            except Exception:
+                                self.reference_anchor_id = None
+                            
                     self.calibration_history = []
                     self.btn_optimize_map.setEnabled(False)
                     
@@ -2687,7 +2706,8 @@ class GroundTruthApp(QMainWindow):
                 self.chk_use_ref_map.setChecked(True)
                 self.push_config_to_worker()
                 
-                self.status_bar_lbl.setText(f"Đã tải bản đồ: {os.path.basename(file_path)} (Anchor ID: {self.reference_anchor_id})")
+                anchor_info = f"Anchor ID: {self.reference_anchor_id}" if self.reference_anchor_id is not None else "Không rõ mỏ neo"
+                self.status_bar_lbl.setText(f"Đã tải bản đồ: {os.path.basename(file_path)} ({anchor_info})")
                 QMessageBox.information(self, "Thành công", f"Đã tải bản đồ chứa {len(self.reference_map)} Tag thành công.")
             except Exception as e:
                 QMessageBox.critical(self, "Lỗi", f"Không thể đọc file: {str(e)}")
