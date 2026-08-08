@@ -621,7 +621,9 @@ class CameraWorker(QThread):
         # Reference Map state
         self._use_ref_map = False
         self._reference_map = None
-        self._use_imu = True
+        self._use_imu = False
+        self._draw_trail = False
+        self._trail_points = []
         self._filtered_R_A = None
         self._filtered_P_A = None
         
@@ -647,7 +649,7 @@ class CameraWorker(QThread):
     def update_config(self, tag_size, source_id, target_ids_str, coord_mode,
                       filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                       enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                      threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type="realsense",
+                      threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, draw_trail, camera_type="realsense",
                       zed_config=None):
         with QMutexLocker(self._mutex):
             self._tag_size = tag_size
@@ -670,6 +672,7 @@ class CameraWorker(QThread):
             self._use_ref_map = use_ref_map
             self._reference_map = reference_map
             self._use_imu = use_imu
+            self._draw_trail = draw_trail
             self._camera_type = camera_type
             if zed_config is not None:
                 self._zed_config = zed_config
@@ -1294,6 +1297,41 @@ class CameraWorker(QThread):
                         if in_frame:
                             cv2.drawFrameAxes(color_image, cam_matrix, dist_coeffs, 
                                               tag['rvec'], tag['tvec'], length=axis_len, thickness=2)
+                
+                # 2.8 Draw tag 1 movement trail with fade out effect
+                with QMutexLocker(self._mutex):
+                    draw_trail = self._draw_trail
+                    
+                if draw_trail:
+                    # If source tag (usually tag 1) is active and detected
+                    if source_id in active_tags and active_tags[source_id]['lost_frames'] == 0:
+                        cx, cy = active_tags[source_id]['center_2d']
+                        self._trail_points.append([int(cx), int(cy), 1.0])
+                    
+                    # Decay opacity of existing trail points and filter out invisible ones
+                    active_trail = []
+                    for pt in self._trail_points:
+                        pt[2] -= 0.04  # opacity decay rate per frame (~25 frames lifetime)
+                        if pt[2] > 0.0:
+                            active_trail.append(pt)
+                    self._trail_points = active_trail
+                    
+                    # Draw lines connecting consecutive trail points
+                    for k in range(len(self._trail_points) - 1):
+                        pt1 = (self._trail_points[k][0], self._trail_points[k][1])
+                        pt2 = (self._trail_points[k+1][0], self._trail_points[k+1][1])
+                        op = self._trail_points[k+1][2]
+                        # Orange trail (BGR: 0, 140, 255) with opacity factor
+                        color = (int(0 * op), int(140 * op), int(255 * op))
+                        cv2.line(color_image, pt1, pt2, color, 3, cv2.LINE_AA)
+                        
+                    # Draw circles on each trail point
+                    for pt in self._trail_points:
+                        x, y, op = pt[0], pt[1], pt[2]
+                        color = (int(0 * op), int(140 * op), int(255 * op))
+                        cv2.circle(color_image, (x, y), 4, color, -1, cv2.LINE_AA)
+                else:
+                    self._trail_points.clear()
                 
                 # Compute distance to plane of targets if source and targets are detected
                 if source_pos is not None and len(target_pts) > 0:
@@ -2090,41 +2128,47 @@ class GroundTruthApp(QMainWindow):
         self.chk_use_ref_map.stateChanged.connect(self.push_config_to_worker)
         stream_grid.addWidget(self.chk_use_ref_map, 3, 0, 1, 2)
         
+        # Checkbox for drawing tag 1 trail
+        self.chk_draw_trail = QCheckBox("Vẽ vệt di chuyển của Tag 1 (Mờ dần)")
+        self.chk_draw_trail.setChecked(False)
+        self.chk_draw_trail.stateChanged.connect(self.push_config_to_worker)
+        stream_grid.addWidget(self.chk_draw_trail, 4, 0, 1, 2)
+        
         # Checkbox for using IMU fusion
         self.chk_use_imu = QCheckBox("Sử dụng cảm biến IMU (D455)")
-        self.chk_use_imu.setChecked(True)
+        self.chk_use_imu.setChecked(False)
         self.chk_use_imu.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_use_imu, 4, 0, 1, 2)
+        stream_grid.addWidget(self.chk_use_imu, 5, 0, 1, 2)
         
         # Button to reset/start new map
         self.btn_reset_map = QPushButton("Tạo bản đồ mới")
         self.btn_reset_map.setObjectName("btn_stop")
         self.btn_reset_map.setEnabled(False)
         self.btn_reset_map.clicked.connect(self.reset_map_calibration)
-        stream_grid.addWidget(self.btn_reset_map, 5, 0, 1, 1)
+        stream_grid.addWidget(self.btn_reset_map, 6, 0, 1, 1)
         
         # Button to append to map (Cuốn chiếu)
         self.btn_calibrate_map = QPushButton("Quét & Nối Tag")
         self.btn_calibrate_map.setObjectName("btn_normal")
         self.btn_calibrate_map.setEnabled(False)
         self.btn_calibrate_map.clicked.connect(self.start_map_calibration)
-        stream_grid.addWidget(self.btn_calibrate_map, 5, 1, 1, 1)
+        stream_grid.addWidget(self.btn_calibrate_map, 6, 1, 1, 1)
 
         self.btn_optimize_map = QPushButton("Tối ưu hóa bản đồ (Global)")
         self.btn_optimize_map.setObjectName("btn_normal")
         self.btn_optimize_map.setEnabled(False)
         self.btn_optimize_map.clicked.connect(self.optimize_map_global)
-        stream_grid.addWidget(self.btn_optimize_map, 6, 0, 1, 2)
+        stream_grid.addWidget(self.btn_optimize_map, 7, 0, 1, 2)
 
         self.btn_save_map = QPushButton("Lưu file (Save)")
         self.btn_save_map.setObjectName("btn_normal")
         self.btn_save_map.clicked.connect(self.save_map_file)
-        stream_grid.addWidget(self.btn_save_map, 7, 0, 1, 1)
+        stream_grid.addWidget(self.btn_save_map, 8, 0, 1, 1)
         
         self.btn_load_map = QPushButton("Tải file (Load)")
         self.btn_load_map.setObjectName("btn_normal")
         self.btn_load_map.clicked.connect(self.load_map_file)
-        stream_grid.addWidget(self.btn_load_map, 7, 1, 1, 1)
+        stream_grid.addWidget(self.btn_load_map, 8, 1, 1, 1)
         
         right_layout.addWidget(stream_group)
         
@@ -2378,6 +2422,7 @@ class GroundTruthApp(QMainWindow):
         use_ref_map = self.chk_use_ref_map.isChecked()
         reference_map = self.reference_map
         use_imu = self.chk_use_imu.isChecked()
+        draw_trail = self.chk_draw_trail.isChecked()
         
         # Read ZED SDK filters/settings
         zed_config = {
@@ -2401,7 +2446,7 @@ class GroundTruthApp(QMainWindow):
         self.worker.update_config(tag_size, source_id, target_ids, coord_mode,
                                   filter_alpha, max_lost_frames, enable_smoothing, enable_keep_alive, window_size,
                                   enable_decimation, enable_hole_filling, enable_spatial, enable_temporal, enable_threshold,
-                                  threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, camera_type,
+                                  threshold_min, threshold_max, laser_power, use_ref_map, reference_map, use_imu, draw_trail, camera_type,
                                   zed_config)
         
     def on_camera_source_changed(self, index):
@@ -2429,7 +2474,7 @@ class GroundTruthApp(QMainWindow):
         elif camera_type == "zed_sdk":
             self.chk_use_imu.setText("Sử dụng cảm biến IMU (ZED 2i)")
             self.chk_use_imu.setEnabled(True)
-            self.chk_use_imu.setChecked(True)
+            self.chk_use_imu.setChecked(False)
             self.chk_show_depth.setEnabled(True)
             self.chk_show_depth.setChecked(True)
             self.status_bar_lbl.setText("Đã chuyển sang ZED 2i (ZED SDK CUDA Mode). Sử dụng GPU tính toán chiều sâu.")
@@ -2437,7 +2482,7 @@ class GroundTruthApp(QMainWindow):
         else:
             self.chk_use_imu.setText("Sử dụng cảm biến IMU (D455)")
             self.chk_use_imu.setEnabled(True)
-            self.chk_use_imu.setChecked(True)
+            self.chk_use_imu.setChecked(False)
             self.chk_show_depth.setEnabled(True)
             self.status_bar_lbl.setText("Đã chuyển sang Intel RealSense D455.")
             self.settings_dialog.cb_coord_mode.setCurrentIndex(0) # depth mode
