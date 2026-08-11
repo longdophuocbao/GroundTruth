@@ -93,7 +93,7 @@ DEFAULT_RS_LASER_POWER = 150      # Công suất phát Laser RealSense mặc đ�
 
 # Tham số ZED SDK (CUDA) mặc định
 DEFAULT_ZED_RESOLUTION = "HD2K"      # Độ phân giải ZED: "HD2K", "HD1080", "HD720", "VGA"
-DEFAULT_ZED_DEPTH_MODE = "NEURAL_PLUS" # Chế độ depth: "NEURAL_PLUS", "NEURAL", "NEURAL_LIGHT", "ULTRA", etc.
+DEFAULT_ZED_DEPTH_MODE = "NEURAL" # Chế độ depth: "NEURAL_PLUS", "NEURAL", "NEURAL_LIGHT", "ULTRA", etc.
 DEFAULT_ZED_SENSING_MODE = "FILL"     # Chế độ cảm nhận: "STANDARD" hoặc "FILL"
 DEFAULT_ZED_CONFIDENCE = 95           # Ngưỡng tin cậy độ sâu ZED (1 - 100)
 DEFAULT_ZED_TEXTURE_CONFIDENCE = 100  # Ngưỡng vân bề mặt ZED (1 - 100)
@@ -800,6 +800,16 @@ class CameraWorker(QThread):
             # Initialize AprilTag detector (using Aruco module in OpenCV 5)
             dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
             parameters = cv2.aruco.DetectorParameters()
+
+            # Tăng bước nhảy phân ngưỡng (giúp giảm số lần lặp phân ngưỡng ảnh, mặc định là 3)                                                                                                            
+            parameters.adaptiveThreshWinSizeStep = 10                                                                                                                                                     
+                                                                                                                                                                                                        
+            # Bỏ qua các đường contour quá nhỏ để không mất công giải mã (mặc định là 0.03)                                                                                                               
+            # parameters.minMarkerPerimeterRate = 0.03                                                                                                                                                      
+                                                                                                                                                                                                        
+            # Tắt tự động lọc góc mặc định của detector nếu bạn đã dùng cornerSubPix ở trên                                                                                                               
+            parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE  
+    
             detector = cv2.aruco.ArucoDetector(dictionary, parameters)
             
             # Wait for sensors to warm up/auto-exposure to stabilize
@@ -873,7 +883,55 @@ class CameraWorker(QThread):
                 
                 # Grayscale for AprilTag detection
                 gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-                corners, ids, rejected = detector.detectMarkers(gray)
+                
+                # Check for active trackers from the previous frame
+                active_tracker_tids = [tid for tid, tracker in self._trackers.items() if tracker.is_tracked]
+                
+                detected_corners = []
+                detected_ids = []
+                
+                if active_tracker_tids:
+                    # ROI Mode: Detect in small regions around previously tracked tags
+                    for tid in active_tracker_tids:
+                        tracker = self._trackers[tid]
+                        # Calculate center from last known corners
+                        cx = int(np.mean(tracker.corners_filtered[:, 0]))
+                        cy = int(np.mean(tracker.corners_filtered[:, 1]))
+                        
+                        # Expand ROI box to accommodate movement (e.g., 350x350)
+                        roi_size = 350
+                        half_size = roi_size // 2
+                        
+                        x1 = max(0, cx - half_size)
+                        y1 = max(0, cy - half_size)
+                        x2 = min(gray.shape[1], cx + half_size)
+                        y2 = min(gray.shape[0], cy + half_size)
+                        
+                        # Crop ROI
+                        roi = gray[y1:y2, x1:x2]
+                        
+                        # Detect markers within ROI
+                        corners_roi, ids_roi, _ = detector.detectMarkers(roi)
+                        
+                        if ids_roi is not None:
+                            for idx, cid_val in enumerate(np.ravel(ids_roi)):
+                                cid = int(cid_val)
+                                # Translate coordinates back to global image coordinates
+                                c_global = corners_roi[idx] + np.array([x1, y1], dtype=np.float32)
+                                detected_corners.append(c_global)
+                                detected_ids.append([cid])
+                                
+                    # If we found any tags in our ROI searches, use them
+                    if len(detected_ids) > 0:
+                        corners = detected_corners
+                        ids = np.array(detected_ids)
+                        rejected = []
+                    else:
+                        # Fallback: if we lost tags in ROI, scan the entire image
+                        corners, ids, rejected = detector.detectMarkers(gray)
+                else:
+                    # Full frame scan if no tags are currently tracked
+                    corners, ids, rejected = detector.detectMarkers(gray)
                 
                 # Setup 3D points for pose estimation (PnP)
                 s = tag_size
@@ -2053,6 +2111,9 @@ class GroundTruthApp(QMainWindow):
         # Map calibration history for global optimization
         self.calibration_history = []
         
+        # SVO recording settings
+        self.svo_file_path = ""
+        
         self.init_ui()
         self.apply_stylesheet()
         
@@ -2166,56 +2227,56 @@ class GroundTruthApp(QMainWindow):
         self.chk_show_depth = QCheckBox("Hiển thị camera Depth chiều sâu")
         self.chk_show_depth.setChecked(False)
         self.chk_show_depth.stateChanged.connect(self.toggle_depth_visibility)
-        stream_grid.addWidget(self.chk_show_depth, 2, 0, 1, 2)
+        stream_grid.addWidget(self.chk_show_depth, 2, 0, 1, 1)
         
         # Checkbox for using reference map
         self.chk_use_ref_map = QCheckBox("Sử dụng bản đồ tham chiếu (Giảm nhiễu)")
         self.chk_use_ref_map.setChecked(False)
         self.chk_use_ref_map.setEnabled(False)
         self.chk_use_ref_map.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_use_ref_map, 3, 0, 1, 2)
+        stream_grid.addWidget(self.chk_use_ref_map, 2, 1, 1, 1)
         
         # Checkbox for drawing tag 1 trail
         self.chk_draw_trail = QCheckBox("Vẽ vệt di chuyển của Tag 1 (Mờ dần)")
         self.chk_draw_trail.setChecked(DEFAULT_DRAW_TRAIL)
         self.chk_draw_trail.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_draw_trail, 4, 0, 1, 2)
+        stream_grid.addWidget(self.chk_draw_trail, 3, 0, 1, 1)
         
         # Checkbox for using IMU fusion
         self.chk_use_imu = QCheckBox("Sử dụng cảm biến IMU (D455)")
         self.chk_use_imu.setChecked(DEFAULT_USE_IMU)
         self.chk_use_imu.stateChanged.connect(self.push_config_to_worker)
-        stream_grid.addWidget(self.chk_use_imu, 5, 0, 1, 2)
+        stream_grid.addWidget(self.chk_use_imu, 3, 1, 1, 1)
         
         # Button to reset/start new map
         self.btn_reset_map = QPushButton("Tạo bản đồ mới")
         self.btn_reset_map.setObjectName("btn_stop")
         self.btn_reset_map.setEnabled(False)
         self.btn_reset_map.clicked.connect(self.reset_map_calibration)
-        stream_grid.addWidget(self.btn_reset_map, 6, 0, 1, 1)
+        stream_grid.addWidget(self.btn_reset_map, 4, 0, 1, 1)
         
         # Button to append to map (Cuốn chiếu)
         self.btn_calibrate_map = QPushButton("Quét & Nối Tag")
         self.btn_calibrate_map.setObjectName("btn_normal")
         self.btn_calibrate_map.setEnabled(False)
         self.btn_calibrate_map.clicked.connect(self.start_map_calibration)
-        stream_grid.addWidget(self.btn_calibrate_map, 6, 1, 1, 1)
+        stream_grid.addWidget(self.btn_calibrate_map, 4, 1, 1, 1)
 
         self.btn_optimize_map = QPushButton("Tối ưu hóa bản đồ (Global)")
         self.btn_optimize_map.setObjectName("btn_normal")
         self.btn_optimize_map.setEnabled(False)
         self.btn_optimize_map.clicked.connect(self.optimize_map_global)
-        stream_grid.addWidget(self.btn_optimize_map, 7, 0, 1, 2)
+        stream_grid.addWidget(self.btn_optimize_map, 5, 0, 1, 2)
 
         self.btn_save_map = QPushButton("Lưu file (Save)")
         self.btn_save_map.setObjectName("btn_normal")
         self.btn_save_map.clicked.connect(self.save_map_file)
-        stream_grid.addWidget(self.btn_save_map, 8, 0, 1, 1)
+        stream_grid.addWidget(self.btn_save_map, 6, 0, 1, 1)
         
         self.btn_load_map = QPushButton("Tải file (Load)")
         self.btn_load_map.setObjectName("btn_normal")
         self.btn_load_map.clicked.connect(self.load_map_file)
-        stream_grid.addWidget(self.btn_load_map, 8, 1, 1, 1)
+        stream_grid.addWidget(self.btn_load_map, 6, 1, 1, 1)
         
         right_layout.addWidget(stream_group)
         
@@ -2270,6 +2331,29 @@ class GroundTruthApp(QMainWindow):
         logger_layout.addWidget(self.btn_select_log)
         
         right_layout.addWidget(logger_group)
+        
+        # 6. SVO video recorder panel (ZED SDK only)
+        self.svo_group = QGroupBox("GHI VIDEO SVO (ZED SDK)")
+        svo_layout = QVBoxLayout(self.svo_group)
+        
+        self.chk_svo_record = QCheckBox("Ghi file SVO (2K, H265)")
+        self.chk_svo_record.stateChanged.connect(self.toggle_svo_record_config)
+        svo_layout.addWidget(self.chk_svo_record)
+        
+        svo_sub_layout = QHBoxLayout()
+        self.lbl_svo_status = QLabel("Chưa chọn file SVO.")
+        self.lbl_svo_status.setObjectName("lbl_svo_status")
+        svo_sub_layout.addWidget(self.lbl_svo_status, 1)
+        
+        self.btn_select_svo = QPushButton("Chọn File Lưu...")
+        self.btn_select_svo.setObjectName("btn_normal")
+        self.btn_select_svo.clicked.connect(self.select_svo_file)
+        svo_sub_layout.addWidget(self.btn_select_svo)
+        
+        svo_layout.addLayout(svo_sub_layout)
+        
+        right_layout.addWidget(self.svo_group)
+        self.svo_group.setVisible(False)
         
         main_layout.addLayout(right_layout, 1)
         
@@ -2507,7 +2591,9 @@ class GroundTruthApp(QMainWindow):
             'confidence': self.settings_dialog.sb_zed_confidence.value(),
             'texture_confidence': self.settings_dialog.sb_zed_texture_confidence.value(),
             'depth_min': self.settings_dialog.sb_zed_depth_min.value(),
-            'depth_max': self.settings_dialog.sb_zed_depth_max.value()
+            'depth_max': self.settings_dialog.sb_zed_depth_max.value(),
+            'svo_record': self.chk_svo_record.isChecked() if hasattr(self, 'chk_svo_record') else False,
+            'svo_path': self.svo_file_path if hasattr(self, 'svo_file_path') else ""
         }
         
         idx = self.cmb_camera_source.currentIndex()
@@ -2528,12 +2614,15 @@ class GroundTruthApp(QMainWindow):
         if index == 1:
             camera_type = "zed_uvc"
             self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - ZED 2i (UVC Mode)")
+            self.svo_group.setVisible(False)
         elif index == 2:
             camera_type = "zed_sdk"
             self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - ZED 2i (ZED SDK CUDA Mode)")
+            self.svo_group.setVisible(True)
         else:
             camera_type = "realsense"
             self.setWindowTitle("Hệ Thống Đo Khoảng Cách AprilTag 3D - Intel RealSense D455")
+            self.svo_group.setVisible(False)
             
         # Cập nhật Settings Dialog dựa trên loại camera đang chọn
         self.settings_dialog.update_camera_mode(camera_type)
@@ -2723,6 +2812,10 @@ class GroundTruthApp(QMainWindow):
         self.btn_calibrate_map.setEnabled(True)
         self.btn_reset_map.setEnabled(True)
         
+        if hasattr(self, 'chk_svo_record'):
+            self.chk_svo_record.setEnabled(False)
+            self.btn_select_svo.setEnabled(False)
+            
         # Reset FPS calculation variables
         self.fps_timer = time.time()
         self.fps_counter = 0
@@ -2752,6 +2845,11 @@ class GroundTruthApp(QMainWindow):
         self.btn_toggle_stream.style().polish(self.btn_toggle_stream)
         self.btn_scan.setEnabled(True)
         self.settings_dialog.sb_source_id.setEnabled(True)
+        
+        if hasattr(self, 'chk_svo_record'):
+            self.chk_svo_record.setEnabled(True)
+            self.btn_select_svo.setEnabled(True)
+            
         self.btn_calibrate_map.setEnabled(False)
         self.btn_reset_map.setEnabled(False)
         
@@ -2912,6 +3010,36 @@ class GroundTruthApp(QMainWindow):
             else:
                 self.lbl_logger_status.setText("Chưa chọn file lưu.")
  
+    def select_svo_file(self):
+        try:
+            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+            file_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Chọn nơi lưu file video ZED SVO",
+                desktop_path,
+                "ZED SVO Files (*.svo)"
+            )
+            if file_path:
+                if not file_path.lower().endswith(".svo"):
+                    file_path += ".svo"
+                self.svo_file_path = file_path
+                self.lbl_svo_status.setText(f"Lưu tại: {os.path.basename(file_path)}")
+                self.lbl_svo_status.setToolTip(file_path)
+                self.chk_svo_record.setChecked(True)
+                self.push_config_to_worker()
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi Chọn File SVO", f"Có lỗi xảy ra: {str(e)}")
+            
+    def toggle_svo_record_config(self, state):
+        is_checked = (state == Qt.Checked.value or state is True or state == 2)
+        if is_checked:
+            if not hasattr(self, 'svo_file_path') or not self.svo_file_path:
+                self.select_svo_file()
+                if not hasattr(self, 'svo_file_path') or not self.svo_file_path:
+                    self.chk_svo_record.setChecked(False)
+                    return
+        self.push_config_to_worker()
+
     @Slot(np.ndarray, dict)
     def update_frame(self, frame_bgr, results):
         # Calculate FPS

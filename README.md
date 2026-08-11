@@ -23,6 +23,7 @@ Hệ thống hỗ trợ đa thiết bị camera đo độ sâu tiên tiến bao 
     *   *Sensing Mode / Fill Mode*: Tự động áp dụng bộ lọc lấp đầy khoảng trống (Vá lỗ hổng chiều sâu) tương thích với cả ZED SDK 3.x/4.x và 5.x.
     *   *Ngưỡng lọc nhiễu*: Tinh chỉnh `Confidence` (Ngưỡng tin cậy) và `Texture Confidence` (Ngưỡng vân bề mặt) trực tiếp.
 *   **Bám vết và lọc nhiễu nâng cao**:
+    *   *Bám vết vùng quan tâm (ROI - Region of Interest Tracking) [Mới]*: Tối ưu hóa xử lý ở độ phân giải cao 2K/HD2K. Chỉ quét tìm AprilTag trong vùng ảnh con $350 \times 350$ xung quanh tọa độ khung hình trước. Giảm diện tích xử lý của CPU hơn 30 lần, tăng mạnh FPS đồng thời bảo toàn độ phân giải gốc 2K để nhìn thấy tag ở xa. Tích hợp cơ chế tự động quét toàn khung hình (Full-frame Fallback) ngay khi mất dấu.
     *   *Bộ lọc mượt EMA (Exponential Moving Average)*: Làm mịn tọa độ 3D và góc quay của thẻ tag, triệt tiêu hiện tượng rung sai số (jitter).
     *   *Cơ chế Keep-Alive*: Duy trì trạng thái và vị trí của thẻ tag khi bị che khuất tạm thời trong số khung hình định trước.
 *   **Giao diện đồ họa (GUI) Hiện đại & Trực quan**:
