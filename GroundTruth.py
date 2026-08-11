@@ -3305,7 +3305,15 @@ class GroundTruthApp(QMainWindow):
     def eventFilter(self, watched, event):
         if hasattr(self, 'right_widget') and watched == self.right_widget:
             if event.type() == QEvent.Leave:
-                self.hide_controls_and_maximize_dist()
+                # Do not hide if the camera source combobox dropdown list is open
+                if hasattr(self, 'cmb_camera_source') and self.cmb_camera_source.view().isVisible():
+                    return False
+                
+                # Check if the global mouse cursor is actually inside the right_widget's geometry
+                global_pos = QCursor.pos()
+                local_pos = self.right_widget.mapFromGlobal(global_pos)
+                if not self.right_widget.rect().contains(local_pos):
+                    self.hide_controls_and_maximize_dist()
             elif event.type() == QEvent.Enter:
                 self.show_controls_and_restore_dist()
 
