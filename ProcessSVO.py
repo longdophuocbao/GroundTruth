@@ -114,10 +114,58 @@ def distance_point_to_fitted_plane(p, qs):
     except Exception:
         return distance_point_to_segment(p, qs[0], qs[-1])
 
+def kabsch_alignment(P, Q):
+    """
+    Tìm ma trận quay R và vector dịch chuyển T sao cho R @ P_i + T xấp xỉ = Q_i.
+    P: Tọa độ tham chiếu trong bản đồ cấu trúc (local)
+    Q: Tọa độ đo được thực tế từ camera
+    """
+    centroid_P = np.mean(P, axis=0)
+    centroid_Q = np.mean(Q, axis=0)
+    
+    P_centered = P - centroid_P
+    Q_centered = Q - centroid_Q
+    
+    H = P_centered.T @ Q_centered
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[2, :] *= -1
+        R = Vt.T @ U.T
+        
+    T = centroid_Q - R @ centroid_P
+    return R, T
+
+def project_points_3d_to_2d(pts_3d, cam_matrix, dist_coeffs):
+    pts_3d = np.array(pts_3d, dtype=np.float32).reshape(-1, 3)
+    rvec = np.zeros(3, dtype=np.float32)
+    tvec = np.zeros(3, dtype=np.float32)
+    img_pts, _ = cv2.projectPoints(pts_3d, rvec, tvec, cam_matrix, dist_coeffs)
+    return img_pts.reshape(-1, 2)
+
 def process_svo(args):
     print(f"\n=======================================================")
     print(f"BẮT ĐẦU XỬ LÝ OFFLINE SVO: {args.svo}")
     print(f"=======================================================")
+    
+    # Nạp bản đồ cấu trúc (Reference Map) nếu có cấu hình
+    reference_map = None
+    if args.map:
+        if not os.path.exists(args.map):
+            print(f"[ERROR] Không tìm thấy tệp bản đồ cấu trúc tại: {args.map}")
+            return
+        try:
+            import json
+            with open(args.map, 'r', encoding='utf-8') as f:
+                map_data = json.load(f)
+                if isinstance(map_data, dict) and 'map' in map_data:
+                    reference_map = map_data['map']
+                else:
+                    reference_map = map_data
+            print(f"[*] Nạp bản đồ cấu trúc thành công từ: {args.map} ({len(reference_map)} thẻ tag)")
+        except Exception as e:
+            print(f"[WARNING] Không thể tải bản đồ cấu trúc: {e}")
+
     
     # 1. Cấu hình ZED SDK đọc tệp SVO
     init_params = sl.InitParameters()
@@ -348,6 +396,77 @@ def process_svo(args):
                     'lost_frames': tracker.lost_frames
                 }
                 
+        # Tái dựng các thẻ tag ảo từ bản đồ cấu trúc (Reference Map)
+        if reference_map is not None:
+            detected_mapped_ids = []
+            for tid_str, ref_data in reference_map.items():
+                tid = int(tid_str)
+                if tid in active_tags and active_tags[tid]['lost_frames'] == 0:
+                    if active_tags[tid]['rvec'] is not None:
+                        detected_mapped_ids.append(tid)
+                        
+            if len(detected_mapped_ids) > 0:
+                # 1. Tính toán ma trận chuyển đổi từ Local sang Camera
+                if len(detected_mapped_ids) >= 3:
+                    P_pts = []
+                    Q_pts = []
+                    for tid in detected_mapped_ids:
+                        ref_data = reference_map[str(tid)]
+                        P_pts.append(ref_data['p_local'])
+                        tag = active_tags[tid]
+                        pos_t = tag['pos_pnp'] if args.coord_mode == 'pnp' else tag['pos_depth']
+                        Q_pts.append(pos_t)
+                    R_L2C, T_L2C = kabsch_alignment(np.array(P_pts), np.array(Q_pts))
+                else:
+                    tid = detected_mapped_ids[0]
+                    tag = active_tags[tid]
+                    pos_t = tag['pos_pnp'] if args.coord_mode == 'pnp' else tag['pos_depth']
+                    R_t, _ = cv2.Rodrigues(tag['rvec'])
+                    
+                    ref_data = reference_map[str(tid)]
+                    p_local = np.array(ref_data['p_local'])
+                    r_local = np.array(ref_data['r_local'])
+                    
+                    R_L2C = R_t @ r_local.T
+                    T_L2C = pos_t - R_L2C @ p_local
+                    
+                # 2. Tái dựng tọa độ 3D của toàn bộ tag trong bản đồ
+                for tid_str, ref_data in reference_map.items():
+                    tid = int(tid_str)
+                    p_local = np.array(ref_data['p_local'])
+                    r_local = np.array(ref_data['r_local'])
+                    
+                    pos_reconstructed = R_L2C @ p_local + T_L2C
+                    R_reconstructed = R_L2C @ r_local
+                    rvec_reconstructed, _ = cv2.Rodrigues(R_reconstructed)
+                    
+                    if tid in active_tags:
+                        active_tags[tid]['pos_pnp'] = pos_reconstructed
+                        active_tags[tid]['pos_depth'] = pos_reconstructed
+                        active_tags[tid]['rvec'] = rvec_reconstructed
+                        active_tags[tid]['tvec'] = pos_reconstructed.reshape(3, 1)
+                    else:
+                        # Chiếu góc 3D về 2D để vẽ lên video
+                        local_corners = np.array([
+                            [-s/2, -s/2, 0],
+                            [ s/2, -s/2, 0],
+                            [ s/2,  s/2, 0],
+                            [-s/2,  s/2, 0]
+                        ], dtype=np.float32)
+                        cam_corners = (R_reconstructed @ local_corners.T).T + pos_reconstructed
+                        pts_2d = project_points_3d_to_2d(cam_corners, cam_matrix, dist_coeffs)
+                        
+                        active_tags[tid] = {
+                            'pos_pnp': pos_reconstructed,
+                            'pos_depth': pos_reconstructed,
+                            'rvec': rvec_reconstructed,
+                            'tvec': pos_reconstructed.reshape(3, 1),
+                            'corners': pts_2d,
+                            'lost_frames': 1,
+                            'is_virtual': True
+                          }
+
+                
         # Tính toán khoảng cách
         source_pos = None
         if args.source_id in active_tags:
@@ -424,6 +543,7 @@ def process_svo(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Xử lý offline tệp ZED SVO với FPS tối đa sử dụng ROI Tracking.")
     parser.add_argument("--svo", type=str, default="HD2K_SN35214682_09-30-47.svo2", help="Đường dẫn tới tệp SVO cần xử lý.")
+    parser.add_argument("--map", type=str, default=None, help="Đường dẫn tới tệp JSON bản đồ cấu trúc (được tạo bởi GroundTruth.py).")
     parser.add_argument("--csv", type=str, default="svo_report.csv", help="Đường dẫn lưu file dữ liệu CSV.")
     parser.add_argument("--output_video", type=str, default=None, help="Đường dẫn lưu video kết quả (ví dụ: result.mp4). Để trống để tắt và đạt FPS cao nhất.")
     parser.add_argument("--depth_mode", type=str, default="PERFORMANCE", choices=["NONE", "PERFORMANCE", "QUALITY", "ULTRA", "NEURAL", "NEURAL_PLUS"],
