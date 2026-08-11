@@ -101,6 +101,37 @@ python GroundTruth.py
 
 ---
 
+## 📊 Xử Lý Offline File SVO Tốc Độ Cao (Không cần GUI)
+
+Để phân tích và trích xuất dữ liệu đo khoảng cách từ các tệp ghi hình **ZED SVO** (ví dụ: `HD2K_SN35214682_09-30-47.svo2`) với hiệu suất tối đa, bạn có thể chạy script chuyên biệt [`ProcessSVO.py`](file:///C:/Users/admin/Documents/Paper/SCI/ground%20truth/ProcessSVO.py) qua dòng lệnh. 
+
+Script này bỏ qua hoàn toàn giao diện đồ họa (GUI) và cơ chế giới hạn tốc độ phát thời gian thực của SDK để xử lý khung hình nhanh nhất có thể.
+
+### Hướng dẫn chạy nhanh:
+Trong môi trường ảo Conda đã được kích hoạt, bạn chạy lệnh sau:
+```powershell
+# Chạy với chế độ SolvePnP thuần (Tắt Depth SDK) để đạt FPS tối đa (>200 FPS)
+python ProcessSVO.py --svo HD2K_SN35214682_09-30-47.svo2 --depth_mode NONE --coord_mode pnp
+
+# Chạy với chế độ đo độ sâu cảm biến tốc độ cao (PERFORMANCE)
+python ProcessSVO.py --svo HD2K_SN35214682_09-30-47.svo2 --depth_mode PERFORMANCE --coord_mode depth
+
+# Chạy với chế độ đo độ sâu AI chất lượng cao (NEURAL)
+python ProcessSVO.py --svo HD2K_SN35214682_09-30-47.svo2 --depth_mode NEURAL --coord_mode depth
+```
+
+### Các tham số tùy chọn chính:
+*   `--svo`: Đường dẫn tới tệp SVO (mặc định: `HD2K_SN35214682_09-30-47.svo2`).
+*   `--csv`: Đường dẫn file đầu ra CSV (mặc định: `svo_report.csv`).
+*   `--depth_mode`: Chế độ tính depth (`NONE`, `PERFORMANCE`, `QUALITY`, `ULTRA`, `NEURAL`, `NEURAL_PLUS`).
+*   `--coord_mode`: Phương pháp tính (`depth` hoặc `pnp`).
+*   `--source_id`: ID AprilTag nguồn (mặc định: `1`).
+*   `--target_ids`: Các ID AprilTag đích, cách nhau bằng dấu phẩy (ví dụ: `"2,3"`).
+*   `--output_video`: Đường dẫn xuất video mp4 đã vẽ đè bám vết (ví dụ: `--output_video result.mp4`). *Lưu ý: Bật tính năng này sẽ làm giảm nhẹ FPS xử lý do tốn tài nguyên mã hóa video.*
+*   `--disable_roi`: Tắt cơ chế ROI tracking để quét toàn khung hình 2K.
+
+---
+
 ## 📦 Biên Dịch Ra File Thực Thi (.exe)
 
 Nếu bạn muốn đóng gói ứng dụng thành một tệp `.exe` chạy độc lập bằng **Nuitka**:
