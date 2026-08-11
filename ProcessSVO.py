@@ -220,7 +220,7 @@ def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
     csv_file = open(args.csv, mode='w', newline='', encoding='utf-8')
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
-        "Frame_Index", "Timestamp_MS", 
+        "Frame_Index", "Timestamp_MS", "Time_Formatted",
         "Source_ID", "Source_X_mm", "Source_Y_mm", "Source_Z_mm",
         "Num_Targets", "Polyline_Dist_mm", "Target_IDs"
     ])
@@ -478,10 +478,16 @@ def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
                 polyline_dist = polyline_dist * 1000.0
                 
         ts_ms = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds()
+        from datetime import datetime
+        try:
+            time_formatted = datetime.fromtimestamp(ts_ms / 1000.0).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        except Exception:
+            time_formatted = ""
+            
         src_coords = [source_pos[0]*1000.0, source_pos[1]*1000.0, source_pos[2]*1000.0] if source_pos is not None else ["", "", ""]
         
         csv_writer.writerow([
-            f_idx, ts_ms, 
+            f_idx, ts_ms, time_formatted,
             args.source_id, src_coords[0], src_coords[1], src_coords[2],
             len(target_pts), polyline_dist if polyline_dist is not None else "",
             ",".join(map(str, detected_targets_list))
