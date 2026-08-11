@@ -16,6 +16,9 @@ Hệ thống hỗ trợ đa thiết bị camera đo độ sâu tiên tiến bao 
 *   **Mô hình đo khoảng cách tới mặt cong (Curved Surface Mesh Distance) [Mới]**:
     *   Thay thế thuật toán khớp mặt phẳng phẳng (Plane Fitting) bằng mô hình lưới mặt cong đa giác 3D.
     *   Tự động chia lưới tam giác từ nhóm thẻ đích (phân chia theo ID Chẵn/Lẻ) và tính khoảng cách vuông góc ngắn nhất từ thẻ nguồn ID 1 tới điểm gần nhất trên lưới mặt cong này.
+*   **Thuật toán lập bản đồ đám mây điểm dựa trên Trọng tâm (Centroid-based Point Cloud Mapping) [Cải tiến]**:
+    *   Bản đồ cục bộ sử dụng **Trọng tâm (Centroid)** của đám mây điểm thẻ đích làm gốc tọa độ.
+    *   Loại bỏ sự phụ thuộc xoay góc tương đối của thẻ mỏ neo (Anchor), giúp tối ưu hóa thuật toán căn chỉnh Kabsch và ghép nối bản đồ tổng thể có độ tin cậy và chính xác cao hơn.
 *   **Bộ lọc chiều sâu RealSense SDK (Post-Processing)**:
     *   *Threshold Filter*: Giới hạn khoảng cách đo chiều sâu Min/Max để lọc bỏ vật thể quá xa hoặc quá gần.
     *   *Decimation Filter*: Giảm độ phân giải chiều sâu giúp tăng tốc độ xử lý và giảm nhiễu hạt.
@@ -28,6 +31,7 @@ Hệ thống hỗ trợ đa thiết bị camera đo độ sâu tiên tiến bao 
 *   **Bám vết và lọc nhiễu nâng cao**:
     *   *Bám vết vùng quan tâm tự động thích ứng (Adaptive ROI Tracking) [Mới]*: Tự động tính toán kích thước vùng ROI tìm kiếm dựa trên khoảng cách camera (3.5 lần kích thước thực tế của tag ở khung hình trước, tối thiểu 150px). Giúp loại bỏ hoàn toàn việc thiết lập ROI thủ công khi khoảng cách camera thay đổi.
     *   *Quét lại toàn khung hình thông minh (Smart Full-frame Fallback) [Mới]*: Tự động quét lại toàn bộ khung hình ngay khi thẻ nguồn (ID 1) bị mất dấu trong vùng ROI, giúp khôi phục bám vết nhanh chóng và ổn định.
+    *   *Tự động ẩn bảng điều khiển & Phóng to số đo (Auto-hide & Max Zoom) [Mới]*: Tự động ẩn bảng điều khiển khi rê chuột ra ngoài cột bên phải để giải phóng không gian hiển thị, đồng thời phóng to số khoảng cách mục tiêu lên cỡ chữ siêu lớn **`150px`** (không kèm tiếp vĩ ngữ đơn vị) giúp dễ dàng đọc số từ xa.
     *   *Bộ lọc mượt EMA (Exponential Moving Average)*: Làm mịn tọa độ 3D và góc quay của thẻ tag, triệt tiêu hiện tượng rung sai số (jitter).
     *   *Cơ chế Keep-Alive*: Duy trì trạng thái và vị trí của thẻ tag khi bị che khuất tạm thời trong số khung hình định trước.
 *   **Giao diện đồ họa (GUI) Hiện đại & Trực quan**:

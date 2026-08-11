@@ -1093,24 +1093,34 @@ class CameraWorker(QThread):
                             target_ids = [tid for tid in sorted(active_tags.keys()) if tid != source_id]
                             
                     detected_targets = [tid for tid in target_ids if tid in active_tags and not active_tags[tid]['lost_frames'] > 0]
-                    if len(detected_targets) > 0:
-                        # Dùng tag đầu tiên quét được làm mỏ neo tạm thời cho bản đồ cục bộ
+                    if len(detected_targets) > 0:# --- BẮT ĐẦU ĐOẠN ĐÃ SỬA ---
+                        # Vẫn giữ biến temp_anchor để làm ID lưu trữ cho dictionary, nhưng không dùng rvec của nó
                         temp_anchor = detected_targets[0]
                         
-                        if temp_anchor in active_tags and active_tags[temp_anchor]['rvec'] is not None:
-                            anchor_tag = active_tags[temp_anchor]
-                            pos_a = anchor_tag['pos_pnp'] if coord_mode == 'pnp' else anchor_tag['pos_depth']
-                            R_a, _ = cv2.Rodrigues(anchor_tag['rvec'])
+                        # Bước 1: Tính Trọng tâm (Centroid) của Đám mây điểm đang nhìn thấy
+                        valid_pts = []
+                        for tid in detected_targets:
+                            tag = active_tags[tid]
+                            if tag['rvec'] is not None:
+                                pos = tag['pos_pnp'] if coord_mode == 'pnp' else tag['pos_depth']
+                                valid_pts.append(pos)
+                                
+                        if len(valid_pts) > 0:
+                            centroid_cam = np.mean(valid_pts, axis=0)
                             
+                            # Bước 2: Tích lũy tọa độ cục bộ dựa trên Trọng tâm
                             for tid in detected_targets:
                                 tag = active_tags[tid]
                                 if tag['rvec'] is not None:
                                     pos_t = tag['pos_pnp'] if coord_mode == 'pnp' else tag['pos_depth']
                                     R_t, _ = cv2.Rodrigues(tag['rvec'])
                                     
-                                    # Tính toán tọa độ cục bộ (Local coordinates)
-                                    p_local = R_a.T @ (pos_t - pos_a)
-                                    r_local = R_a.T @ R_t
+                                    # Tọa độ cục bộ (Local Map) lấy Trọng tâm làm gốc.
+                                    # KHÔNG nhân với ma trận xoay (R_a.T) của tag mỏ neo nữa!
+                                    p_local = pos_t - centroid_cam
+                                    
+                                    # Giữ nguyên góc xoay gốc của camera để ghép nối Kabsch sau này
+                                    r_local = R_t 
                                     
                                     if tid not in self._calibration_data_p:
                                         self._calibration_data_p[tid] = []
@@ -1119,7 +1129,7 @@ class CameraWorker(QThread):
                                     self._calibration_data_r[tid].append(r_local)
                                     
                             self._calibration_frames_collected += 1
-                            self.status_msg.emit(f"Đang quét bản đồ cục bộ... Khung hình {self._calibration_frames_collected}/60")
+                            self.status_msg.emit(f"Đang lập bản đồ đám mây điểm... Khung hình {self._calibration_frames_collected}/60")
                             
                             if self._calibration_frames_collected >= 60:
                                 local_map = {}
@@ -1136,9 +1146,12 @@ class CameraWorker(QThread):
                                         local_map[str(tid)] = {
                                             'p_local': p_avg.tolist(),
                                             'r_local': r_avg.tolist()
-                                        }                                # LƯU TRỮ VÀ GHÉP BẢN ĐỒ (MAP STITCHING)
+                                        }
+                                        
+                                # LƯU TRỮ VÀ GHÉP BẢN ĐỒ (MAP STITCHING)
                                 import copy
                                 ref_map_local = copy.deepcopy(self._reference_map) if getattr(self, '_reference_map', None) is not None else {}
+                                # --- KẾT THÚC ĐOẠN ĐÃ SỬA (Giữ nguyên toàn bộ code bên dưới từ đoạn if not ref_map_local:) ---
                                     
                                 if not ref_map_local:
                                     # Nếu bản đồ tổng trống, lấy bản đồ cục bộ làm bản đồ tổng
@@ -1818,7 +1831,7 @@ class CameraWorker(QThread):
         
         # Overlay value text
         mid_pt = (int((pt_src[0] + pt_dst[0]) / 2) + 15, int((pt_src[1] + pt_dst[1]) / 2) - 5)
-        cv2.putText(image, f"{label}: {distance_mm:.1f}mm", mid_pt,
+        cv2.putText(image, f"{label}: {distance_mm:.1f}", mid_pt,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
     # Logger logic
@@ -3226,9 +3239,9 @@ class GroundTruthApp(QMainWindow):
         
         # Update metrics cards
         # Polyline distance display
-        font_size = "90px" if getattr(self, 'is_zoomed', False) else "28px"
+        font_size = "150px" if getattr(self, 'is_zoomed', False) else "28px"
         if results['polyline_dist'] is not None:
-            self.lbl_poly_val.setText(f"{results['polyline_dist']:.1f} mm")
+            self.lbl_poly_val.setText(f"{results['polyline_dist']:.1f}")
             self.lbl_poly_val.setStyleSheet(f"color: #00e676; font-size: {font_size}; font-weight: bold;")
         else:
             self.lbl_poly_val.setText("N/A")
