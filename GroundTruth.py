@@ -2281,9 +2281,6 @@ class GroundTruthApp(QMainWindow):
         right_layout.addWidget(stream_group)
         
         # 3. Measurements cards (large display)
-        measure_group = QGroupBox("KẾT QUẢ ĐO KHOẢNG CÁCH")
-        measure_vbox = QVBoxLayout(measure_group)
-        
         # Card: Polyline distance
         card_poly = QFrameCard(self)
         card_poly_layout = QVBoxLayout(card_poly)
@@ -2295,22 +2292,17 @@ class GroundTruthApp(QMainWindow):
         card_poly_layout.addWidget(card_poly_title)
         card_poly_layout.addWidget(self.lbl_poly_val)
         
-        measure_vbox.addWidget(card_poly)
-        right_layout.addWidget(measure_group)
+        right_layout.addWidget(card_poly)
         
         # 4. Detected tags list table
-        table_group = QGroupBox("DANH SÁCH TAG ĐANG PHÁT HIỆN")
-        table_vbox = QVBoxLayout(table_group)
-        
         self.table_tags = QTableWidget()
         self.table_tags.setColumnCount(6)
         self.table_tags.setHorizontalHeaderLabels(["ID", "Vai trò", "Trạng thái", "X (mm)", "Y (mm)", "Z (mm)"])
         self.table_tags.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_tags.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table_tags.setObjectName("table_tags")
-        table_vbox.addWidget(self.table_tags)
         
-        right_layout.addWidget(table_group, 1) # table gets remaining vertical stretch
+        right_layout.addWidget(self.table_tags, 1) # table gets remaining vertical stretch
         
         # 5. Data logger panel
         logger_group = QGroupBox("GHI NHẬT KÝ ĐO LƯỜNG (REAL-TIME LOGGER)")

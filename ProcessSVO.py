@@ -25,8 +25,19 @@ try:
     import pyzed.sl as sl
 except ImportError:
     print("[ERROR] Thư viện 'pyzed' (ZED SDK Python wrapper) chưa được cài đặt.")
-    print("Vui lòng chạy file get_python_api.py trong thư mục ZED SDK để cài đặt.")
-    sys.exit(1)
+    print("Vui lòng cài đặt ZED SDK để tiếp tục.")
+
+# PySide6 GUI imports
+try:
+    from PySide6.QtCore import Qt, QThread, Signal, Slot, QObject
+    from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
+                                 QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, 
+                                 QLineEdit, QGroupBox, QComboBox, QFileDialog, 
+                                 QMessageBox, QDoubleSpinBox, QSpinBox, QProgressBar, QTextEdit, QCheckBox)
+    from PySide6.QtGui import QFont, QColor
+    HAS_GUI_LIBS = True
+except ImportError:
+    HAS_GUI_LIBS = False
 
 class TagTracker:
     def __init__(self, tag_id, alpha=0.7, max_lost_frames=15):
@@ -115,11 +126,6 @@ def distance_point_to_fitted_plane(p, qs):
         return distance_point_to_segment(p, qs[0], qs[-1])
 
 def kabsch_alignment(P, Q):
-    """
-    Tìm ma trận quay R và vector dịch chuyển T sao cho R @ P_i + T xấp xỉ = Q_i.
-    P: Tọa độ tham chiếu trong bản đồ cấu trúc (local)
-    Q: Tọa độ đo được thực tế từ camera
-    """
     centroid_P = np.mean(P, axis=0)
     centroid_Q = np.mean(Q, axis=0)
     
@@ -143,17 +149,23 @@ def project_points_3d_to_2d(pts_3d, cam_matrix, dist_coeffs):
     img_pts, _ = cv2.projectPoints(pts_3d, rvec, tvec, cam_matrix, dist_coeffs)
     return img_pts.reshape(-1, 2)
 
-def process_svo(args):
-    print(f"\n=======================================================")
-    print(f"BẮT ĐẦU XỬ LÝ OFFLINE SVO: {args.svo}")
-    print(f"=======================================================")
+def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
+    def print_msg(msg):
+        if log_cb:
+            log_cb(msg)
+        else:
+            print(msg)
+
+    print_msg(f"=======================================================")
+    print_msg(f"BẮT ĐẦU XỬ LÝ OFFLINE SVO: {args.svo}")
+    print_msg(f"=======================================================")
     
     # Nạp bản đồ cấu trúc (Reference Map) nếu có cấu hình
     reference_map = None
     if args.map:
         if not os.path.exists(args.map):
-            print(f"[ERROR] Không tìm thấy tệp bản đồ cấu trúc tại: {args.map}")
-            return
+            print_msg(f"[ERROR] Không tìm thấy tệp bản đồ cấu trúc tại: {args.map}")
+            return False, "Không tìm thấy file bản đồ cấu trúc."
         try:
             import json
             with open(args.map, 'r', encoding='utf-8') as f:
@@ -162,22 +174,18 @@ def process_svo(args):
                     reference_map = map_data['map']
                 else:
                     reference_map = map_data
-            print(f"[*] Nạp bản đồ cấu trúc thành công từ: {args.map} ({len(reference_map)} thẻ tag)")
+            print_msg(f"[*] Nạp bản đồ cấu trúc thành công từ: {args.map} ({len(reference_map)} thẻ tag)")
         except Exception as e:
-            print(f"[WARNING] Không thể tải bản đồ cấu trúc: {e}")
-
+            print_msg(f"[WARNING] Không thể tải bản đồ cấu trúc: {e}")
     
     # 1. Cấu hình ZED SDK đọc tệp SVO
     init_params = sl.InitParameters()
     init_params.set_from_svo_file(args.svo)
-    
-    # KHÔNG giới hạn theo thời gian thực để chạy với tốc độ cao nhất
     init_params.svo_real_time_mode = False
     init_params.coordinate_units = sl.UNIT.METER
     
-    # Lựa chọn chế độ depth tương ứng
     depth_mode_map = {
-        "NONE": sl.DEPTH_MODE.NONE, # Cực nhanh, chỉ chạy PnP trên CPU
+        "NONE": sl.DEPTH_MODE.NONE,
         "NEURAL": getattr(sl.DEPTH_MODE, "NEURAL", sl.DEPTH_MODE.QUALITY),
         "NEURAL_PLUS": getattr(sl.DEPTH_MODE, "NEURAL_PLUS", sl.DEPTH_MODE.QUALITY),
         "ULTRA": sl.DEPTH_MODE.ULTRA,
@@ -187,32 +195,28 @@ def process_svo(args):
     
     selected_depth_mode = depth_mode_map.get(args.depth_mode.upper(), sl.DEPTH_MODE.PERFORMANCE)
     init_params.depth_mode = selected_depth_mode
-    print(f"[*] Cấu hình chế độ Depth: {args.depth_mode.upper()}")
+    print_msg(f"[*] Chế độ Depth: {args.depth_mode.upper()}")
     
     zed = sl.Camera()
     err = zed.open(init_params)
     if err != sl.ERROR_CODE.SUCCESS:
-        print(f"[ERROR] Không thể mở tệp SVO: {err}")
-        return
+        msg = f"Không thể mở tệp SVO: {err}"
+        print_msg(f"[ERROR] {msg}")
+        return False, msg
         
     nb_frames = zed.get_svo_number_of_frames()
-    print(f"[*] Tổng số khung hình trong SVO: {nb_frames}")
+    print_msg(f"[*] Tổng số khung hình: {nb_frames}")
     
     # 2. Cấu hình bộ nhận diện AprilTag
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
     parameters = cv2.aruco.DetectorParameters()
-    
-    # Tối ưu hóa tham số detector để xử lý nhanh hơn nữa
     parameters.adaptiveThreshWinSizeStep = 10
     parameters.minMarkerPerimeterRate = 0.03
-    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE # Dùng ROI bám góc nên không cần refine toàn cục
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE
     
     detector = cv2.aruco.ArucoDetector(dictionary, parameters)
     
-    # Cài đặt biến lưu trữ
     trackers = {}
-    
-    # Chuẩn bị file CSV để xuất dữ liệu
     csv_file = open(args.csv, mode='w', newline='', encoding='utf-8')
     csv_writer = csv.writer(csv_file)
     csv_writer.writerow([
@@ -221,33 +225,28 @@ def process_svo(args):
         "Num_Targets", "Polyline_Dist_mm", "Target_IDs"
     ])
     
-    # Nếu cấu hình ghi đè Video để xem kết quả
     video_writer = None
     if args.output_video:
-        # Lấy thông số độ phân giải thực tế của camera
         cam_info = zed.get_camera_information()
         w = cam_info.camera_configuration.resolution.width
         h = cam_info.camera_configuration.resolution.height
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = cv2.VideoWriter(args.output_video, fourcc, 30.0, (w, h))
-        print(f"[*] Đang bật ghi video kết quả ra: {args.output_video} (Tốc độ xử lý sẽ giảm nhẹ do encoder)")
+        print_msg(f"[*] Ghi video kết quả ra: {args.output_video}")
     
-    # Tạo các ma trận trung gian
     image_mat = sl.Mat()
     depth_mat = sl.Mat()
     runtime_params = sl.RuntimeParameters()
     
-    # Lấy thông số Calibration
     calib = zed.get_camera_information().camera_configuration.calibration_parameters.left_cam
     cam_matrix = np.array([
         [calib.fx, 0, calib.cx],
         [0, calib.fy, calib.cy],
         [0, 0, 1]
     ], dtype=np.float32)
-    dist_coeffs = np.zeros(5, dtype=np.float32) # SVO đã được Rectify sẵn bởi SDK nên coeffs bằng 0
+    dist_coeffs = np.zeros(5, dtype=np.float32)
     
-    # Cấu hình đối tượng 3D AprilTag phục vụ giải PnP
-    s = args.tag_size / 1000.0 # Quy đổi mm sang mét
+    s = args.tag_size / 1000.0
     obj_points = np.array([
         [-s/2, -s/2, 0],
         [ s/2, -s/2, 0],
@@ -255,7 +254,6 @@ def process_svo(args):
         [-s/2,  s/2, 0]
     ], dtype=np.float32)
     
-    # Phân tích danh sách Target Tag IDs
     target_ids = []
     if args.target_ids:
         try:
@@ -263,33 +261,34 @@ def process_svo(args):
         except Exception:
             pass
             
-    print(f"[*] Thẻ Nguồn (Source): ID {args.source_id}")
-    print(f"[*] Danh sách Thẻ Đích (Targets): {target_ids}")
+    print_msg(f"[*] Thẻ Nguồn (Source): ID {args.source_id}")
+    print_msg(f"[*] Danh sách Thẻ Đích (Targets): {target_ids}")
     
-    # Đo đạc hiệu năng FPS
     start_time = time.time()
     processed_count = 0
     
-    print("\n--- BẮT ĐẦU CHẠY PHÂN TÍCH (FPS TỐI ĐA) ---")
+    print_msg("\n--- BẮT ĐẦU CHẠY PHÂN TÍCH (FPS TỐI ĐA) ---")
     
     for f_idx in range(nb_frames):
-        # Đọc khung hình
+        # Kiểm tra lệnh huỷ từ giao diện
+        if cancel_check and cancel_check():
+            print_msg("\n[CANCEL] Đã yêu cầu hủy bỏ xử lý từ người dùng.")
+            break
+            
         if zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
             break
             
-        # Lấy ảnh trái (Left RGB)
         zed.retrieve_image(image_mat, sl.VIEW.LEFT)
         bgra_image = image_mat.get_data()
         color_image = cv2.cvtColor(bgra_image, cv2.COLOR_BGRA2BGR)
         gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
         
-        # Lấy dữ liệu độ sâu (nếu chế độ depth không phải NONE)
         depth_data = None
         if selected_depth_mode != sl.DEPTH_MODE.NONE:
             zed.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
             depth_data = depth_mat.get_data()
             
-        # --- THUẬT TOÁN ROI TRACKING ---
+        # ROI Tracking
         active_tracker_tids = [tid for tid, tracker in trackers.items() if tracker.is_tracked]
         detected_corners = []
         detected_ids = []
@@ -324,7 +323,6 @@ def process_svo(args):
         else:
             corners, ids, rejected = detector.detectMarkers(gray)
             
-        # Cập nhật thông tin các tag phát hiện được
         detected_this_frame = set()
         active_tags = {}
         
@@ -334,18 +332,15 @@ def process_svo(args):
                 tag_id = int(tag_id_val)
                 corners_i = np.array(corners[i], dtype=np.float32).reshape(4, 2)
                 
-                # Giải thuật PnP tính tọa độ 3D
                 success, rvec, tvec = cv2.solvePnP(obj_points, corners_i, cam_matrix, dist_coeffs)
                 p_3d_pnp = tvec.flatten() if success else np.array([0.0, 0.0, 0.0])
                 
-                # Giải thuật dùng cảm biến độ sâu (Depth)
                 p_3d_depth = p_3d_pnp.copy()
                 depth_val = 0.0
                 if depth_data is not None:
                     u_c = float(np.mean(corners_i[:, 0]))
                     v_c = float(np.mean(corners_i[:, 1]))
                     
-                    # Trích xuất giá trị độ sâu trung vị xung quanh tâm
                     depth_w = depth_data.shape[1]
                     depth_h = depth_data.shape[0]
                     u_c_depth = int(u_c * depth_w / color_image.shape[1])
@@ -363,33 +358,26 @@ def process_svo(args):
                         depth_val = float(np.median(depths))
                         
                     if depth_val > 0.0:
-                        # Deproject
                         z = depth_val
                         x = (u_c - calib.cx) * z / calib.fx
                         y = (v_c - calib.cy) * z / calib.fy
                         p_3d_depth = np.array([x, y, z])
                 
-                # Cập nhật bộ lọc
                 if tag_id not in trackers:
                     trackers[tag_id] = TagTracker(tag_id, alpha=args.filter_alpha, max_lost_frames=args.max_lost_frames)
                 trackers[tag_id].update(corners_i, p_3d_pnp, p_3d_depth, rvec, tvec,
                                         alpha=args.filter_alpha, max_lost_frames=args.max_lost_frames)
                 detected_this_frame.add(tag_id)
                 
-        # Dự đoán cho các tag bị mất dấu tạm thời
         for tid, tracker in list(trackers.items()):
             if tid not in detected_this_frame:
                 tracker.predict(max_lost_frames=args.max_lost_frames)
                 
-        # Tổng hợp dữ liệu các tag đang active
         for tid, tracker in trackers.items():
             if tracker.is_tracked:
-                pos_pnp = tracker.pos_pnp_filtered
-                pos_depth = tracker.pos_depth_filtered
-                
                 active_tags[tid] = {
-                    'pos_pnp': pos_pnp,
-                    'pos_depth': pos_depth,
+                    'pos_pnp': tracker.pos_pnp_filtered,
+                    'pos_depth': tracker.pos_depth_filtered,
                     'corners': tracker.corners_filtered,
                     'rvec': tracker.rvec_filtered,
                     'tvec': tracker.tvec_filtered,
@@ -406,7 +394,6 @@ def process_svo(args):
                         detected_mapped_ids.append(tid)
                         
             if len(detected_mapped_ids) > 0:
-                # 1. Tính toán ma trận chuyển đổi từ Local sang Camera
                 if len(detected_mapped_ids) >= 3:
                     P_pts = []
                     Q_pts = []
@@ -430,7 +417,6 @@ def process_svo(args):
                     R_L2C = R_t @ r_local.T
                     T_L2C = pos_t - R_L2C @ p_local
                     
-                # 2. Tái dựng tọa độ 3D của toàn bộ tag trong bản đồ
                 for tid_str, ref_data in reference_map.items():
                     tid = int(tid_str)
                     p_local = np.array(ref_data['p_local'])
@@ -446,7 +432,6 @@ def process_svo(args):
                         active_tags[tid]['rvec'] = rvec_reconstructed
                         active_tags[tid]['tvec'] = pos_reconstructed.reshape(3, 1)
                     else:
-                        # Chiếu góc 3D về 2D để vẽ lên video
                         local_corners = np.array([
                             [-s/2, -s/2, 0],
                             [ s/2, -s/2, 0],
@@ -464,10 +449,8 @@ def process_svo(args):
                             'corners': pts_2d,
                             'lost_frames': 1,
                             'is_virtual': True
-                          }
-
-                
-        # Tính toán khoảng cách
+                        }
+                        
         source_pos = None
         if args.source_id in active_tags:
             src_tag = active_tags[args.source_id]
@@ -485,9 +468,8 @@ def process_svo(args):
         if source_pos is not None and len(target_pts) > 0:
             polyline_dist, _ = distance_point_to_fitted_plane(source_pos, target_pts)
             if polyline_dist is not None:
-                polyline_dist = polyline_dist * 1000.0 # Quy đổi sang mm
+                polyline_dist = polyline_dist * 1000.0
                 
-        # Ghi dữ liệu vào CSV
         ts_ms = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds()
         src_coords = [source_pos[0]*1000.0, source_pos[1]*1000.0, source_pos[2]*1000.0] if source_pos is not None else ["", "", ""]
         
@@ -498,9 +480,7 @@ def process_svo(args):
             ",".join(map(str, detected_targets_list))
         ])
         
-        # Vẽ đồ họa vẽ đè kết quả lên video (nếu bật)
         if video_writer is not None:
-            # Vẽ viền cho các tag đang active
             for tid, tag in active_tags.items():
                 corners_i = tag['corners'].astype(np.int32)
                 color = (0, 0, 255) if tid == args.source_id else ((0, 255, 255) if tid in target_ids else (128, 128, 128))
@@ -509,20 +489,20 @@ def process_svo(args):
                     cv2.line(color_image, tuple(corners_i[k]), tuple(corners_i[(k+1)%4]), color, thickness)
                 cv2.putText(color_image, f"ID:{tid}", (int(corners_i[0][0]), int(corners_i[0][1]) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-            # Ghi thông tin FPS lên hình
             cv2.putText(color_image, f"Frame: {f_idx}/{nb_frames}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             video_writer.write(color_image)
             
         processed_count += 1
         
-        # In tiến trình xử lý mỗi 100 khung hình
+        # Cập nhật GUI
+        if progress_cb:
+            progress_cb(processed_count, nb_frames)
+            
         if processed_count % 100 == 0 or processed_count == nb_frames:
             elapsed = time.time() - start_time
             curr_fps = processed_count / elapsed if elapsed > 0 else 0
-            print(f" -> Đã xử lý {processed_count}/{nb_frames} khung hình ({processed_count/nb_frames*100:.1f}%). FPS hiện tại: {curr_fps:.2f}")
+            print_msg(f" -> Đã xử lý {processed_count}/{nb_frames} khung hình ({processed_count/nb_frames*100:.1f}%). FPS hiện tại: {curr_fps:.2f}")
             
-    # Dọn dẹp
     csv_file.close()
     if video_writer is not None:
         video_writer.release()
@@ -530,38 +510,389 @@ def process_svo(args):
     
     total_elapsed = time.time() - start_time
     final_fps = processed_count / total_elapsed if total_elapsed > 0 else 0
-    print(f"\n=======================================================")
-    print(f"HOÀN THÀNH XỬ LÝ SVO!")
-    print(f"Tổng số frame đã xử lý: {processed_count}")
-    print(f"Tổng thời gian: {total_elapsed:.2f} giây")
-    print(f"FPS TRUNG BÌNH ĐẠT ĐƯỢC: {final_fps:.2f} khung hình/giây")
-    print(f"Dữ liệu CSV xuất ra: {args.csv}")
+    print_msg(f"\n=======================================================")
+    print_msg(f"HOÀN THÀNH XỬ LÝ SVO!")
+    print_msg(f"Tổng số frame đã xử lý: {processed_count}")
+    print_msg(f"Tổng thời gian: {total_elapsed:.2f} giây")
+    print_msg(f"FPS TRUNG BÌNH ĐẠT ĐƯỢC: {final_fps:.2f} khung hình/giây")
+    print_msg(f"Dữ liệu CSV xuất ra: {args.csv}")
     if args.output_video:
-        print(f"Video kết quả xuất ra: {args.output_video}")
-    print(f"=======================================================")
+        print_msg(f"Video kết quả xuất ra: {args.output_video}")
+    print_msg(f"=======================================================")
+    return True, f"Thành công! FPS trung bình: {final_fps:.2f}"
 
+# ----------------- GUI IMPLEMENTATION -----------------
+if HAS_GUI_LIBS:
+    class SVOWorkerThread(QThread):
+        progress_updated = Signal(int, int)
+        log_received = Signal(str)
+        finished_signal = Signal(bool, str)
+
+        def __init__(self, args):
+            super().__init__()
+            self.args = args
+            self.cancel_requested = False
+
+        def run(self):
+            def log_callback(msg):
+                self.log_received.emit(msg)
+                
+            def progress_callback(curr, total):
+                self.progress_updated.emit(curr, total)
+                
+            def cancel_callback():
+                return self.cancel_requested
+
+            try:
+                success, message = process_svo(
+                    self.args, 
+                    log_cb=log_callback, 
+                    progress_cb=progress_callback, 
+                    cancel_check=cancel_callback
+                )
+                self.finished_signal.emit(success, message)
+            except Exception as e:
+                self.finished_signal.emit(False, str(e))
+
+    class ProcessSVOGUI(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Bộ Xử Lý Offline SVO - AprilTag 3D Ground Truth")
+            self.resize(750, 650)
+            self.worker = None
+            self.init_ui()
+            self.apply_stylesheet()
+            self.auto_find_files()
+
+        def init_ui(self):
+            central_widget = QWidget()
+            self.setCentralWidget(central_widget)
+            main_layout = QVBoxLayout(central_widget)
+            
+            # --- FILE SELECTION GROUP ---
+            file_group = QGroupBox("Cấu hình Đường dẫn Tệp")
+            file_layout = QGridLayout(file_group)
+            
+            file_layout.addWidget(QLabel("Tệp SVO Đầu vào:"), 0, 0)
+            self.txt_svo = QLineEdit()
+            self.btn_browse_svo = QPushButton("Duyệt...")
+            self.btn_browse_svo.clicked.connect(self.browse_svo)
+            file_layout.addWidget(self.txt_svo, 0, 1)
+            file_layout.addWidget(self.btn_browse_svo, 0, 2)
+            
+            file_layout.addWidget(QLabel("Bản đồ cấu trúc (.json - Tùy chọn):"), 1, 0)
+            self.txt_map = QLineEdit()
+            self.btn_browse_map = QPushButton("Duyệt...")
+            self.btn_browse_map.clicked.connect(self.browse_map)
+            file_layout.addWidget(self.txt_map, 1, 1)
+            file_layout.addWidget(self.btn_browse_map, 1, 2)
+            
+            file_layout.addWidget(QLabel("Tệp CSV Kết quả:"), 2, 0)
+            self.txt_csv = QLineEdit("svo_report.csv")
+            self.btn_browse_csv = QPushButton("Lưu tại...")
+            self.btn_browse_csv.clicked.connect(self.browse_csv)
+            file_layout.addWidget(self.txt_csv, 2, 1)
+            file_layout.addWidget(self.btn_browse_csv, 2, 2)
+            
+            file_layout.addWidget(QLabel("Video kết quả (.mp4 - Tùy chọn):"), 3, 0)
+            self.txt_video = QLineEdit()
+            self.txt_video.setPlaceholderText("Đường dẫn lưu video kết quả để xem (FPS sẽ giảm nhẹ)")
+            self.btn_browse_video = QPushButton("Lưu tại...")
+            self.btn_browse_video.clicked.connect(self.browse_video)
+            file_layout.addWidget(self.txt_video, 3, 1)
+            file_layout.addWidget(self.btn_browse_video, 3, 2)
+            
+            main_layout.addWidget(file_group)
+            
+            # --- PARAMETERS GROUP ---
+            param_group = QGroupBox("Tham số Thuật toán")
+            param_layout = QGridLayout(param_group)
+            
+            # Chế độ depth
+            param_layout.addWidget(QLabel("Chế độ Depth:"), 0, 0)
+            self.cb_depth = QComboBox()
+            self.cb_depth.addItems(["PERFORMANCE", "NONE", "NEURAL_PLUS", "NEURAL", "ULTRA", "QUALITY"])
+            param_layout.addWidget(self.cb_depth, 0, 1)
+            
+            # Giải thuật khoảng cách
+            param_layout.addWidget(QLabel("Thuật toán Khoảng cách:"), 0, 2)
+            self.cb_coord = QComboBox()
+            self.cb_coord.addItems(["depth", "pnp"])
+            param_layout.addWidget(self.cb_coord, 0, 3)
+            
+            # Tag Source ID
+            param_layout.addWidget(QLabel("ID Thẻ Nguồn (Source):"), 1, 0)
+            self.sb_source_id = QSpinBox()
+            self.sb_source_id.setValue(1)
+            param_layout.addWidget(self.sb_source_id, 1, 1)
+            
+            # Tag target IDs
+            param_layout.addWidget(QLabel("Danh sách ID Thẻ Đích (Targets):"), 1, 2)
+            self.txt_targets = QLineEdit()
+            self.txt_targets.setPlaceholderText("Ví dụ: 2, 3")
+            param_layout.addWidget(self.txt_targets, 1, 3)
+            
+            # Tag Size
+            param_layout.addWidget(QLabel("Kích thước AprilTag (mm):"), 2, 0)
+            self.sb_tag_size = QDoubleSpinBox()
+            self.sb_tag_size.setRange(1.0, 1000.0)
+            self.sb_tag_size.setValue(150.0)
+            param_layout.addWidget(self.sb_tag_size, 2, 1)
+            
+            # ROI Size
+            param_layout.addWidget(QLabel("Kích thước Vùng ROI (px):"), 2, 2)
+            self.sb_roi_size = QSpinBox()
+            self.sb_roi_size.setRange(50, 1000)
+            self.sb_roi_size.setValue(350)
+            param_layout.addWidget(self.sb_roi_size, 2, 3)
+            
+            # ROI Checkbox
+            self.chk_disable_roi = QCheckBox("Tắt bám vết vùng ROI (Quét toàn khung hình 2K)")
+            param_layout.addWidget(self.chk_disable_roi, 3, 0, 1, 4)
+            
+            main_layout.addWidget(param_group)
+            
+            # --- CONSOLE/LOG GROUP ---
+            log_group = QGroupBox("Nhật ký Xử lý")
+            log_layout = QVBoxLayout(log_group)
+            self.txt_log = QTextEdit()
+            self.txt_log.setReadOnly(True)
+            self.txt_log.setFont(QFont("Consolas", 10))
+            log_layout.addWidget(self.txt_log)
+            main_layout.addWidget(log_group)
+            
+            # --- PROGRESS BAR AND BUTTONS ---
+            bottom_layout = QHBoxLayout()
+            self.progress_bar = QProgressBar()
+            self.progress_bar.setValue(0)
+            bottom_layout.addWidget(self.progress_bar)
+            
+            self.btn_run = QPushButton("BẮT ĐẦU XỬ LÝ SVO")
+            self.btn_run.clicked.connect(self.start_processing)
+            bottom_layout.addWidget(self.btn_run)
+            
+            main_layout.addLayout(bottom_layout)
+
+        def apply_stylesheet(self):
+            self.setStyleSheet("""
+                QMainWindow {
+                    background-color: #1a1a1a;
+                }
+                QLabel {
+                    color: #d1d1d1;
+                    font-size: 13px;
+                }
+                QGroupBox {
+                    font-weight: bold;
+                    border: 1px solid #2d2d2d;
+                    border-radius: 8px;
+                    margin-top: 15px;
+                    padding-top: 15px;
+                    background-color: #222222;
+                    color: #00e5ff;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    left: 10px;
+                    padding: 0 6px;
+                    color: #00e5ff;
+                    font-size: 12px;
+                    text-transform: uppercase;
+                }
+                QLineEdit, QComboBox {
+                    background-color: #2c2c2c;
+                    border: 1px solid #3c3c3c;
+                    border-radius: 4px;
+                    padding: 5px;
+                    color: #ffffff;
+                }
+                QDoubleSpinBox, QSpinBox {
+                    background-color: #2c2c2c;
+                    border: 1px solid #3c3c3c;
+                    border-radius: 4px;
+                    padding: 5px;
+                    color: #ffffff;
+                }
+                QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus {
+                    border: 1px solid #00e5ff;
+                }
+                QCheckBox {
+                    color: #d1d1d1;
+                }
+                QPushButton {
+                    background-color: #00c853;
+                    border: none;
+                    border-radius: 4px;
+                    padding: 8px 16px;
+                    color: #ffffff;
+                    font-weight: bold;
+                    font-size: 13px;
+                }
+                QPushButton:hover {
+                    background-color: #00e676;
+                }
+                QPushButton[btnType="danger"] {
+                    background-color: #d32f2f;
+                }
+                QPushButton[btnType="danger"]:hover {
+                    background-color: #f44336;
+                }
+                QTextEdit {
+                    background-color: #121212;
+                    border: 1px solid #2d2d2d;
+                    color: #ffffff;
+                    border-radius: 4px;
+                }
+                QProgressBar {
+                    border: 1px solid #2d2d2d;
+                    border-radius: 4px;
+                    background-color: #222222;
+                    text-align: center;
+                    color: #ffffff;
+                    font-weight: bold;
+                    height: 25px;
+                }
+                QProgressBar::chunk {
+                    background-color: #00e5ff;
+                }
+            """)
+
+        def auto_find_files(self):
+            # Tự động quét tìm file svo mặc định
+            default_svo = "HD2K_SN35214682_09-30-47.svo2"
+            if os.path.exists(default_svo):
+                self.txt_svo.setText(os.path.abspath(default_svo))
+                
+            # Quét tìm file bản đồ .json gần nhất trong thư mục
+            files = sorted([f for f in os.listdir('.') if f.startswith('reference_map_autosave') and f.endswith('.json')])
+            if files:
+                self.txt_map.setText(os.path.abspath(files[-1]))
+
+        def browse_svo(self):
+            path, _ = QFileDialog.getOpenFileName(self, "Chọn file ZED SVO", "", "SVO Files (*.svo *.svo2)")
+            if path:
+                self.txt_svo.setText(path)
+
+        def browse_map(self):
+            path, _ = QFileDialog.getOpenFileName(self, "Chọn file bản đồ cấu trúc JSON", "", "JSON Files (*.json)")
+            if path:
+                self.txt_map.setText(path)
+
+        def browse_csv(self):
+            path, _ = QFileDialog.getSaveFileName(self, "Lưu tệp CSV", "", "CSV Files (*.csv)")
+            if path:
+                self.txt_csv.setText(path)
+
+        def browse_video(self):
+            path, _ = QFileDialog.getSaveFileName(self, "Lưu Video bám vết", "", "Video Files (*.mp4)")
+            if path:
+                self.txt_video.setText(path)
+
+        def start_processing(self):
+            if self.worker and self.worker.isRunning():
+                # Hủy bỏ xử lý
+                self.btn_run.setEnabled(False)
+                self.worker.cancel_requested = True
+                self.txt_log.append("\n[GUI] Đang gửi yêu cầu dừng xử lý...")
+                return
+
+            svo_path = self.txt_svo.text().strip()
+            if not svo_path or not os.path.exists(svo_path):
+                QMessageBox.warning(self, "Cảnh báo", "Vui lòng chọn đường dẫn tệp SVO hợp lệ.")
+                return
+                
+            # Đọc cấu hình từ UI đóng gói làm args
+            class DummyArgs:
+                pass
+            args = DummyArgs()
+            args.svo = svo_path
+            args.map = self.txt_map.text().strip() if self.txt_map.text().strip() else None
+            args.csv = self.txt_csv.text().strip()
+            args.output_video = self.txt_video.text().strip() if self.txt_video.text().strip() else None
+            args.depth_mode = self.cb_depth.currentText()
+            args.coord_mode = self.cb_coord.currentText()
+            args.source_id = self.sb_source_id.value()
+            args.target_ids = self.txt_targets.text().strip()
+            args.tag_size = self.sb_tag_size.value()
+            args.roi_size = self.sb_roi_size.value()
+            args.filter_alpha = 0.7
+            args.max_lost_frames = 15
+            args.disable_roi = self.chk_disable_roi.isChecked()
+
+            # Thiết lập UI hoạt động
+            self.txt_log.clear()
+            self.progress_bar.setValue(0)
+            self.btn_run.setText("HỦY BỎ XỬ LÝ")
+            self.btn_run.setProperty("btnType", "danger")
+            self.apply_stylesheet() # Cập nhật màu nút đỏ
+
+            # Khởi chạy Worker Thread
+            self.worker = SVOWorkerThread(args)
+            self.worker.progress_updated.connect(self.update_progress)
+            self.worker.log_received.connect(self.write_log)
+            self.worker.finished_signal.connect(self.processing_finished)
+            self.worker.start()
+
+        @Slot(int, int)
+        def update_progress(self, curr, total):
+            if total > 0:
+                percent = int(curr / total * 100)
+                self.progress_bar.setValue(percent)
+
+        @Slot(str)
+        def write_log(self, text):
+            self.txt_log.append(text)
+            # Tự động cuộn xuống cuối
+            self.txt_log.ensureCursorVisible()
+
+        @Slot(bool, str)
+        def processing_finished(self, success, message):
+            self.btn_run.setText("BẮT ĐẦU XỬ LÝ SVO")
+            self.btn_run.setProperty("btnType", "normal")
+            self.btn_run.setEnabled(True)
+            self.apply_stylesheet()
+
+            if success:
+                QMessageBox.information(self, "Hoàn thành", f"Quá trình xử lý SVO hoàn tất!\n\n{message}")
+            else:
+                QMessageBox.critical(self, "Lỗi xảy ra", f"Xử lý thất bại:\n\n{message}")
+
+# --- ENTRY POINT ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Xử lý offline tệp ZED SVO với FPS tối đa sử dụng ROI Tracking.")
-    parser.add_argument("--svo", type=str, default="HD2K_SN35214682_09-30-47.svo2", help="Đường dẫn tới tệp SVO cần xử lý.")
-    parser.add_argument("--map", type=str, default=None, help="Đường dẫn tới tệp JSON bản đồ cấu trúc (được tạo bởi GroundTruth.py).")
-    parser.add_argument("--csv", type=str, default="svo_report.csv", help="Đường dẫn lưu file dữ liệu CSV.")
-    parser.add_argument("--output_video", type=str, default=None, help="Đường dẫn lưu video kết quả (ví dụ: result.mp4). Để trống để tắt và đạt FPS cao nhất.")
-    parser.add_argument("--depth_mode", type=str, default="PERFORMANCE", choices=["NONE", "PERFORMANCE", "QUALITY", "ULTRA", "NEURAL", "NEURAL_PLUS"],
-                        help="Chế độ depth của ZED SDK. Chọn 'NONE' để chỉ dùng SolvePnP (đạt tốc độ >200 FPS).")
-    parser.add_argument("--coord_mode", type=str, default="depth", choices=["depth", "pnp"], help="Giải thuật tính khoảng cách.")
-    parser.add_argument("--tag_size", type=float, default=150.0, help="Kích thước viền ngoài AprilTag (mm).")
-    parser.add_argument("--source_id", type=int, default=1, help="ID thẻ nguồn.")
-    parser.add_argument("--target_ids", type=str, default="", help="Danh sách ID thẻ mục tiêu (ngăn cách bằng dấu phẩy, ví dụ '2,3').")
-    parser.add_argument("--roi_size", type=int, default=350, help="Kích thước vùng tìm kiếm ROI xung quanh tag.")
-    parser.add_argument("--filter_alpha", type=float, default=0.7, help="Hệ số EMA làm mịn.")
-    parser.add_argument("--max_lost_frames", type=int, default=15, help="Số khung hình tối đa giữ trạng thái khi mất dấu.")
-    parser.add_argument("--disable_roi", action="store_true", help="Tắt tính năng ROI Tracking (chạy quét toàn khung hình để so sánh).")
-    
-    args = parser.parse_args()
-    
-    # Kiểm tra sự tồn tại của tệp SVO
-    if not os.path.exists(args.svo):
-        print(f"[ERROR] Không tìm thấy tệp SVO tại đường dẫn: {args.svo}")
-        sys.exit(1)
+    # Nhận diện tham số dòng lệnh
+    if len(sys.argv) > 1:
+        # Chạy chế độ dòng lệnh (CLI Mode)
+        parser = argparse.ArgumentParser(description="Xử lý offline tệp ZED SVO với FPS tối đa sử dụng ROI Tracking.")
+        parser.add_argument("--svo", type=str, default="HD2K_SN35214682_09-30-47.svo2", help="Đường dẫn tới tệp SVO cần xử lý.")
+        parser.add_argument("--map", type=str, default=None, help="Đường dẫn tới tệp JSON bản đồ cấu trúc (được tạo bởi GroundTruth.py).")
+        parser.add_argument("--csv", type=str, default="svo_report.csv", help="Đường dẫn lưu file dữ liệu CSV.")
+        parser.add_argument("--output_video", type=str, default=None, help="Đường dẫn lưu video kết quả (ví dụ: result.mp4). Để trống để tắt và đạt FPS cao nhất.")
+        parser.add_argument("--depth_mode", type=str, default="PERFORMANCE", choices=["NONE", "PERFORMANCE", "QUALITY", "ULTRA", "NEURAL", "NEURAL_PLUS"],
+                            help="Chế độ depth của ZED SDK. Chọn 'NONE' để chỉ dùng SolvePnP (đạt tốc độ >200 FPS).")
+        parser.add_argument("--coord_mode", type=str, default="depth", choices=["depth", "pnp"], help="Giải thuật tính khoảng cách.")
+        parser.add_argument("--tag_size", type=float, default=150.0, help="Kích thước viền ngoài AprilTag (mm).")
+        parser.add_argument("--source_id", type=int, default=1, help="ID thẻ nguồn.")
+        parser.add_argument("--target_ids", type=str, default="", help="Danh sách ID thẻ mục tiêu (ngăn cách bằng dấu phẩy, ví dụ '2,3').")
+        parser.add_argument("--roi_size", type=int, default=350, help="Kích thước vùng tìm kiếm ROI xung quanh tag.")
+        parser.add_argument("--filter_alpha", type=float, default=0.7, help="Hệ số EMA làm mịn.")
+        parser.add_argument("--max_lost_frames", type=int, default=15, help="Số khung hình tối đa giữ trạng thái khi mất dấu.")
+        parser.add_argument("--disable_roi", action="store_true", help="Tắt tính năng ROI Tracking (chạy quét toàn khung hình để so sánh).")
         
-    process_svo(args)
+        args = parser.parse_args()
+        
+        if not os.path.exists(args.svo):
+            print(f"[ERROR] Không tìm thấy tệp SVO tại đường dẫn: {args.svo}")
+            sys.exit(1)
+            
+        process_svo(args)
+    else:
+        # Chạy chế độ giao diện đồ họa (GUI Mode)
+        if not HAS_GUI_LIBS:
+            print("[ERROR] Không tìm thấy PySide6. Vui lòng cài đặt để chạy GUI.")
+            sys.exit(1)
+            
+        app = QApplication(sys.argv)
+        gui = ProcessSVOGUI()
+        gui.show()
+        sys.exit(app.exec())

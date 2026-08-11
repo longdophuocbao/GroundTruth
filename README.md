@@ -110,16 +110,16 @@ Script này bỏ qua hoàn toàn giao diện đồ họa (GUI) và cơ chế gi�
 ### Hướng dẫn chạy nhanh:
 Trong môi trường ảo Conda đã được kích hoạt, bạn chạy lệnh sau:
 ```powershell
+# Khởi động Giao diện đồ họa (GUI Mode) để chọn tệp và cấu hình trực quan:
+python ProcessSVO.py
+
+# Hoặc chạy chế độ Dòng lệnh (CLI Mode) bằng các tham số:
 # Chạy với chế độ SolvePnP thuần (Tắt Depth SDK) để đạt FPS tối đa (>200 FPS)
 python ProcessSVO.py --svo HD2K_SN35214682_09-30-47.svo2 --depth_mode NONE --coord_mode pnp
 
-# Chạy với chế độ đo độ sâu cảm biến tốc độ cao (PERFORMANCE)
-python ProcessSVO.py --svo HD2K_SN35214682_09-30-47.svo2 --depth_mode PERFORMANCE --coord_mode depth
-
-# Chạy với chế độ đo độ sâu AI chất lượng cao (NEURAL)
-python ProcessSVO.py --svo HD2K_SN35214682_09-30-47.svo2 --depth_mode NEURAL --coord_mode depth
+# Chạy kết hợp với bản đồ cấu trúc (Map) đo độ sâu tốc độ cao
+python ProcessSVO.py --svo HD2K_SN35214682_09-30-47.svo2 --map reference_map_autosave_20260808_173241.json --depth_mode PERFORMANCE --coord_mode depth
 ```
-
 ### Các tham số tùy chọn chính:
 *   `--svo`: Đường dẫn tới tệp SVO (mặc định: `HD2K_SN35214682_09-30-47.svo2`).
 *   `--csv`: Đường dẫn file đầu ra CSV (mặc định: `svo_report.csv`).
