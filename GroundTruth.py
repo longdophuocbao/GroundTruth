@@ -63,7 +63,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel,
                              QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, 
                              QLineEdit, QTableWidget, QTableWidgetItem, QHeaderView, 
                              QGroupBox, QComboBox, QFileDialog, QMessageBox, QCheckBox,
-                             QDoubleSpinBox, QSpinBox, QDialog, QToolTip)
+                             QDoubleSpinBox, QSpinBox, QDialog, QToolTip, QSizePolicy)
 from PySide6.QtGui import QImage, QPixmap, QFont, QColor, QIcon, QCursor
 
 # ==============================================================================
@@ -2233,6 +2233,7 @@ class GroundTruthApp(QMainWindow):
         self.plot_poly_history = []
         self.plot_start_time = None
         self.max_history_points = 300 # scrolling window size (e.g. 10s at 30fps)
+        self.is_zoomed = False
         
         # FPS tracker
         self.fps_timer = time.time()
@@ -2333,11 +2334,17 @@ class GroundTruthApp(QMainWindow):
         main_layout.addLayout(left_layout, 2)
         
         # Right Area: Control Panel & Tables
-        right_layout = QVBoxLayout()
+        self.right_widget = QWidget()
+        self.right_widget.setObjectName("right_widget")
+        self.right_widget.installEventFilter(self)
+        
+        right_layout = QVBoxLayout(self.right_widget)
+        right_layout.setContentsMargins(5, 5, 5, 5)
+        right_layout.setSpacing(10)
         
         # 1. Connection and Stream controls
-        stream_group = QGroupBox("ĐIỀU KHIỂN THIẾT BỊ")
-        stream_grid = QGridLayout(stream_group)
+        self.stream_group = QGroupBox("ĐIỀU KHIỂN THIẾT BỊ")
+        stream_grid = QGridLayout(self.stream_group)
         
         self.lbl_camera_source = QLabel("Chọn Camera:")
         self.cmb_camera_source = QComboBox()
@@ -2411,18 +2418,19 @@ class GroundTruthApp(QMainWindow):
         self.btn_load_map.clicked.connect(self.load_map_file)
         stream_grid.addWidget(self.btn_load_map, 6, 1, 1, 1)
         
-        right_layout.addWidget(stream_group)
+        right_layout.addWidget(self.stream_group)
         
         # 3. Measurements cards (large display)
         # Card: Polyline distance
         card_poly = QFrameCard(self)
+        card_poly.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         card_poly_layout = QVBoxLayout(card_poly)
-        card_poly_title = QLabel("KHOẢNG CÁCH AprilTag ID1 ĐẾN ĐƯỜNG MỤC TIÊU")
-        card_poly_title.setObjectName("card_title")
+        self.card_poly_title = QLabel("KHOẢNG CÁCH AprilTag ID1 ĐẾN ĐƯỜNG MỤC TIÊU")
+        self.card_poly_title.setObjectName("card_title")
         self.lbl_poly_val = QLabel("N/A")
         self.lbl_poly_val.setObjectName("lbl_poly_val")
         self.lbl_poly_val.setAlignment(Qt.AlignCenter)
-        card_poly_layout.addWidget(card_poly_title)
+        card_poly_layout.addWidget(self.card_poly_title)
         card_poly_layout.addWidget(self.lbl_poly_val)
         
         right_layout.addWidget(card_poly)
@@ -2438,8 +2446,8 @@ class GroundTruthApp(QMainWindow):
         right_layout.addWidget(self.table_tags, 1) # table gets remaining vertical stretch
         
         # 5. Data logger panel
-        logger_group = QGroupBox("GHI NHẬT KÝ ĐO LƯỜNG (REAL-TIME LOGGER)")
-        logger_layout = QHBoxLayout(logger_group)
+        self.logger_group = QGroupBox("GHI NHẬT KÝ ĐO LƯỜNG (REAL-TIME LOGGER)")
+        logger_layout = QHBoxLayout(self.logger_group)
         
         self.chk_logging = QCheckBox("Bật ghi nhật ký trực tiếp")
         self.chk_logging.setEnabled(False)
@@ -2455,7 +2463,7 @@ class GroundTruthApp(QMainWindow):
         self.btn_select_log.clicked.connect(self.select_log_file)
         logger_layout.addWidget(self.btn_select_log)
         
-        right_layout.addWidget(logger_group)
+        right_layout.addWidget(self.logger_group)
         
         # 6. SVO video recorder panel (ZED SDK only)
         self.svo_group = QGroupBox("GHI VIDEO SVO (ZED SDK)")
@@ -2480,7 +2488,7 @@ class GroundTruthApp(QMainWindow):
         right_layout.addWidget(self.svo_group)
         self.svo_group.setVisible(False)
         
-        main_layout.addLayout(right_layout, 1)
+        main_layout.addWidget(self.right_widget, 1)
         
         # Load reference map if exists
         if self.reference_map is not None:
@@ -3218,12 +3226,13 @@ class GroundTruthApp(QMainWindow):
         
         # Update metrics cards
         # Polyline distance display
+        font_size = "90px" if getattr(self, 'is_zoomed', False) else "28px"
         if results['polyline_dist'] is not None:
             self.lbl_poly_val.setText(f"{results['polyline_dist']:.1f} mm")
-            self.lbl_poly_val.setStyleSheet("color: #00e676; font-size: 28px; font-weight: bold;")
+            self.lbl_poly_val.setStyleSheet(f"color: #00e676; font-size: {font_size}; font-weight: bold;")
         else:
             self.lbl_poly_val.setText("N/A")
-            self.lbl_poly_val.setStyleSheet("color: #757575; font-size: 28px; font-weight: bold;")
+            self.lbl_poly_val.setStyleSheet(f"color: #757575; font-size: {font_size}; font-weight: bold;")
             
         # Update detected tags table
         detected = results['detected_tags']
@@ -3260,7 +3269,46 @@ class GroundTruthApp(QMainWindow):
             self.table_tags.setItem(idx, 4, item_y)
             self.table_tags.setItem(idx, 5, item_z)
 
+    def hide_controls_and_maximize_dist(self):
+        self.is_zoomed = True
+        self.stream_group.hide()
+        self.logger_group.hide()
+        self.table_tags.hide()
+        self.svo_group.hide()
+        self.card_poly_title.hide()
+        
+        # Immediately update the label style
+        font_size = "90px"
+        if self.lbl_poly_val.text() != "N/A" and "mm" in self.lbl_poly_val.text():
+            self.lbl_poly_val.setStyleSheet(f"color: #00e676; font-size: {font_size}; font-weight: bold;")
+        else:
+            self.lbl_poly_val.setStyleSheet(f"color: #757575; font-size: {font_size}; font-weight: bold;")
+
+    def show_controls_and_restore_dist(self):
+        self.is_zoomed = False
+        self.stream_group.show()
+        self.logger_group.show()
+        self.table_tags.show()
+        self.card_poly_title.show()
+        # Only show svo_group if camera source is ZED SDK
+        is_zed = self.cmb_camera_source.currentIndex() == 2
+        if is_zed:
+            self.svo_group.show()
+            
+        # Immediately update the label style
+        font_size = "28px"
+        if self.lbl_poly_val.text() != "N/A" and "mm" in self.lbl_poly_val.text():
+            self.lbl_poly_val.setStyleSheet(f"color: #00e676; font-size: {font_size}; font-weight: bold;")
+        else:
+            self.lbl_poly_val.setStyleSheet(f"color: #757575; font-size: {font_size}; font-weight: bold;")
+
     def eventFilter(self, watched, event):
+        if hasattr(self, 'right_widget') and watched == self.right_widget:
+            if event.type() == QEvent.Leave:
+                self.hide_controls_and_maximize_dist()
+            elif event.type() == QEvent.Enter:
+                self.show_controls_and_restore_dist()
+
         if watched == self.depth_label and event.type() == QEvent.MouseMove:
             if self.current_depth_matrix is not None:
                 orig_h, orig_w = self.current_depth_matrix.shape[:2]
