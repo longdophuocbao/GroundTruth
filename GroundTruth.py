@@ -3391,18 +3391,25 @@ class GroundTruthApp(QMainWindow):
             local_map = hist['local_map']
             
             local_anchor_str = str(local_anchor)
-            if local_anchor_str not in self.reference_map:
+            if local_anchor_str not in self.reference_map or local_anchor_str not in local_map:
                 continue
                 
+            R_anchor_local = np.array(local_map[local_anchor_str]['r_local'])
+            p_anchor_local = np.array(local_map[local_anchor_str]['p_local'])
             R_anchor_global = np.array(self.reference_map[local_anchor_str]['r_local'])
+            
+            # Rotation matrix from local camera frame to global map frame
+            R_L2G = R_anchor_global @ R_anchor_local.T
             
             for tid_str, data in local_map.items():
                 tid = int(tid_str)
                 if tid == local_anchor:
                     continue
                     
-                p_rel = np.array(data['p_local'])
-                d_val = R_anchor_global @ p_rel
+                # Relative position vector in local camera frame
+                p_rel_local = np.array(data['p_local']) - p_anchor_local
+                # Rotate relative vector into the global frame
+                d_val = R_L2G @ p_rel_local
                 
                 for dim in range(3):
                     row_coeffs = [0.0] * (num_vars * 3)
