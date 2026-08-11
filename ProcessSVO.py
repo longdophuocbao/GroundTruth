@@ -254,12 +254,17 @@ def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
         [-s/2,  s/2, 0]
     ], dtype=np.float32)
     
+    # Phân tích danh sách Target Tag IDs
     target_ids = []
     if args.target_ids:
         try:
             target_ids = [int(x.strip()) for x in args.target_ids.split(",") if x.strip().isdigit()]
         except Exception:
             pass
+            
+    # Nếu cấu hình trống, tự động nạp tất cả các tag từ bản đồ (ngoại trừ tag nguồn)
+    if not target_ids and reference_map is not None:
+        target_ids = [int(tid_str) for tid_str in reference_map.keys() if int(tid_str) != args.source_id]
             
     print_msg(f"[*] Thẻ Nguồn (Source): ID {args.source_id}")
     print_msg(f"[*] Danh sách Thẻ Đích (Targets): {target_ids}")
@@ -458,7 +463,9 @@ def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
             
         target_pts = []
         detected_targets_list = []
-        for tid in target_ids:
+        # Nếu target_ids rỗng, tự động lấy toàn bộ các tag đang active khác ngoài tag nguồn
+        curr_target_ids = target_ids if len(target_ids) > 0 else [tid for tid in active_tags.keys() if tid != args.source_id]
+        for tid in curr_target_ids:
             if tid in active_tags:
                 pos = active_tags[tid]['pos_pnp'] if args.coord_mode == 'pnp' else active_tags[tid]['pos_depth']
                 target_pts.append(pos)
