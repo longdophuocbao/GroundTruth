@@ -125,6 +125,134 @@ def distance_point_to_fitted_plane(p, qs):
     except Exception:
         return distance_point_to_segment(p, qs[0], qs[-1])
 
+def distance_point_to_polyline(p, qs):
+    if len(qs) == 0:
+        return None, None
+    if len(qs) == 1:
+        dist = np.linalg.norm(p - qs[0])
+        return dist, qs[0]
+        
+    min_dist = float('inf')
+    best_closest = None
+    for i in range(len(qs) - 1):
+        dist, closest = distance_point_to_segment(p, qs[i], qs[i+1])
+        if dist < min_dist:
+            min_dist = dist
+            best_closest = closest
+    return min_dist, best_closest
+
+def distance_point_to_triangle(p, a, b, c):
+    # 1. Project p onto the plane of the triangle
+    ab = b - a
+    ac = c - a
+    normal = np.cross(ab, ac)
+    normal_norm = np.linalg.norm(normal)
+    if normal_norm == 0.0:
+        # Degenerate triangle, treat as segments
+        d1, cl1 = distance_point_to_segment(p, a, b)
+        d2, cl2 = distance_point_to_segment(p, b, c)
+        d3, cl3 = distance_point_to_segment(p, c, a)
+        d_min = min(d1, d2, d3)
+        if d_min == d1: return d1, cl1
+        elif d_min == d2: return d2, cl2
+        else: return d3, cl3
+        
+    n = normal / normal_norm
+    ap = p - a
+    dist_plane = np.dot(ap, n)
+    p_proj = p - dist_plane * n
+    
+    # 2. Check if projected point is inside the triangle using barycentric coordinates
+    v0 = b - a
+    v1 = c - a
+    v2 = p_proj - a
+    
+    d00 = np.dot(v0, v0)
+    d01 = np.dot(v0, v1)
+    d11 = np.dot(v1, v1)
+    d20 = np.dot(v2, v0)
+    d21 = np.dot(v2, v1)
+    
+    denom = d00 * d11 - d01 * d01
+    if abs(denom) < 1e-8:
+        # Degenerate, fallback to edges
+        d1, cl1 = distance_point_to_segment(p, a, b)
+        d2, cl2 = distance_point_to_segment(p, b, c)
+        d3, cl3 = distance_point_to_segment(p, c, a)
+        d_min = min(d1, d2, d3)
+        if d_min == d1: return d1, cl1
+        elif d_min == d2: return d2, cl2
+        else: return d3, cl3
+        
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1.0 - v - w
+    
+    if u >= -1e-5 and v >= -1e-5 and w >= -1e-5:
+        # Inside the triangle
+        return abs(dist_plane), p_proj
+    else:
+        # Outside, find the closest point on the 3 edges
+        d1, cl1 = distance_point_to_segment(p, a, b)
+        d2, cl2 = distance_point_to_segment(p, b, c)
+        d3, cl3 = distance_point_to_segment(p, c, a)
+        d_min = min(d1, d2, d3)
+        if d_min == d1: return d1, cl1
+        elif d_min == d2: return d2, cl2
+        else: return d3, cl3
+
+def distance_point_to_mesh_surface(p, even_detected, odd_detected, target_map):
+    """
+    Calculates the minimum distance from point p to the surface mesh
+    formed by even and odd targets.
+    """
+    # If we have at least 2 even and 2 odd targets, we can form a mesh
+    if len(even_detected) > 1 and len(odd_detected) > 1:
+        min_dist = float('inf')
+        best_closest = None
+        
+        num_patches = min(len(even_detected), len(odd_detected)) - 1
+        for i in range(num_patches):
+            p1 = target_map[even_detected[i]]
+            p2 = target_map[even_detected[i+1]]
+            p3 = target_map[odd_detected[i+1]]
+            p4 = target_map[odd_detected[i]]
+            
+            # Triangle 1: (p1, p2, p3)
+            d1, cl1 = distance_point_to_triangle(p, p1, p2, p3)
+            if d1 < min_dist:
+                min_dist = d1
+                best_closest = cl1
+                
+            # Triangle 2: (p1, p3, p4)
+            d2, cl2 = distance_point_to_triangle(p, p1, p3, p4)
+            if d2 < min_dist:
+                min_dist = d2
+                best_closest = cl2
+                
+        return min_dist, best_closest
+        
+    # Fallback 1: If we only have even targets (or only odd targets), treat as polyline
+    elif len(even_detected) > 1:
+        pts = [target_map[tid] for tid in even_detected]
+        return distance_point_to_polyline(p, pts)
+    elif len(odd_detected) > 1:
+        pts = [target_map[tid] for tid in odd_detected]
+        return distance_point_to_polyline(p, pts)
+        
+    # Fallback 2: If we only have a total of 2 points, treat as segment
+    elif len(target_map) == 2:
+        keys = list(target_map.keys())
+        return distance_point_to_segment(p, target_map[keys[0]], target_map[keys[1]])
+        
+    # Fallback 3: If we only have 1 point, distance is direct Euclidean distance
+    elif len(target_map) == 1:
+        key = list(target_map.keys())[0]
+        pos = target_map[key]
+        return np.linalg.norm(p - pos), pos
+        
+    return None, None
+
 def kabsch_alignment(P, Q):
     centroid_P = np.mean(P, axis=0)
     centroid_Q = np.mean(Q, axis=0)
@@ -304,7 +432,24 @@ def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
                 cx = int(np.mean(tracker.corners_filtered[:, 0]))
                 cy = int(np.mean(tracker.corners_filtered[:, 1]))
                 
-                half_size = args.roi_size // 2
+                # Determine ROI size
+                if args.roi_size <= 0:
+                    # Automatically calculate ROI size based on tag size in the previous frame
+                    corners_prev = tracker.corners_filtered
+                    tag_size_px = 100.0  # default fallback
+                    if corners_prev is not None and len(corners_prev) == 4:
+                        min_x_prev = np.min(corners_prev[:, 0])
+                        max_x_prev = np.max(corners_prev[:, 0])
+                        min_y_prev = np.min(corners_prev[:, 1])
+                        max_y_prev = np.max(corners_prev[:, 1])
+                        tag_w_prev = max_x_prev - min_x_prev
+                        tag_h_prev = max_y_prev - min_y_prev
+                        tag_size_px = max(tag_w_prev, tag_h_prev)
+                    roi_size = max(150, int(tag_size_px * 3.5))
+                else:
+                    roi_size = args.roi_size
+                
+                half_size = roi_size // 2
                 x1 = max(0, cx - half_size)
                 y1 = max(0, cy - half_size)
                 x2 = min(gray.shape[1], cx + half_size)
@@ -320,10 +465,18 @@ def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
                         detected_corners.append(c_global)
                         detected_ids.append([tag_id])
             
-            if len(detected_ids) > 0:
+            # Check if the source tag (args.source_id) is successfully detected in the ROI searches
+            source_detected_in_roi = False
+            for cid_list in detected_ids:
+                if cid_list[0] == args.source_id:
+                    source_detected_in_roi = True
+                    break
+            
+            if len(detected_ids) > 0 and source_detected_in_roi:
                 corners = detected_corners
                 ids = np.array(detected_ids)
             else:
+                # Fallback: scan the entire image if source tag or all tags are lost in ROI
                 corners, ids, rejected = detector.detectMarkers(gray)
         else:
             corners, ids, rejected = detector.detectMarkers(gray)
@@ -473,9 +626,20 @@ def process_svo(args, log_cb=None, progress_cb=None, cancel_check=None):
                 
         polyline_dist = None
         if source_pos is not None and len(target_pts) > 0:
-            polyline_dist, _ = distance_point_to_fitted_plane(source_pos, target_pts)
-            if polyline_dist is not None:
-                polyline_dist = polyline_dist * 1000.0
+            target_map = {}
+            for tid in curr_target_ids:
+                if tid in active_tags:
+                    pos = active_tags[tid]['pos_pnp'] if args.coord_mode == 'pnp' else active_tags[tid]['pos_depth']
+                    target_map[tid] = pos
+            
+            even_ids = [tid for tid in curr_target_ids if tid % 2 == 0]
+            odd_ids = [tid for tid in curr_target_ids if tid % 2 != 0]
+            even_detected = [tid for tid in even_ids if tid in target_map]
+            odd_detected = [tid for tid in odd_ids if tid in target_map]
+            
+            poly_dist, _ = distance_point_to_mesh_surface(source_pos, even_detected, odd_detected, target_map)
+            if poly_dist is not None:
+                polyline_dist = poly_dist * 1000.0
                 
         ts_ms = zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds()
         from datetime import datetime
@@ -655,8 +819,9 @@ if HAS_GUI_LIBS:
             # ROI Size
             param_layout.addWidget(QLabel("Kích thước Vùng ROI (px):"), 2, 2)
             self.sb_roi_size = QSpinBox()
-            self.sb_roi_size.setRange(50, 1000)
-            self.sb_roi_size.setValue(350)
+            self.sb_roi_size.setRange(0, 1000)
+            self.sb_roi_size.setSpecialValueText("Tự động (Auto)")
+            self.sb_roi_size.setValue(0)
             param_layout.addWidget(self.sb_roi_size, 2, 3)
             
             # ROI Checkbox
@@ -887,7 +1052,7 @@ if __name__ == "__main__":
         parser.add_argument("--tag_size", type=float, default=150.0, help="Kích thước viền ngoài AprilTag (mm).")
         parser.add_argument("--source_id", type=int, default=1, help="ID thẻ nguồn.")
         parser.add_argument("--target_ids", type=str, default="", help="Danh sách ID thẻ mục tiêu (ngăn cách bằng dấu phẩy, ví dụ '2,3').")
-        parser.add_argument("--roi_size", type=int, default=350, help="Kích thước vùng tìm kiếm ROI xung quanh tag.")
+        parser.add_argument("--roi_size", type=int, default=0, help="Kích thước vùng tìm kiếm ROI xung quanh tag. Nhập 0 để tự động chọn dựa theo kích thước tag.")
         parser.add_argument("--filter_alpha", type=float, default=0.7, help="Hệ số EMA làm mịn.")
         parser.add_argument("--max_lost_frames", type=int, default=15, help="Số khung hình tối đa giữ trạng thái khi mất dấu.")
         parser.add_argument("--disable_roi", action="store_true", help="Tắt tính năng ROI Tracking (chạy quét toàn khung hình để so sánh).")

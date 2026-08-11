@@ -805,7 +805,7 @@ class CameraWorker(QThread):
             parameters.adaptiveThreshWinSizeStep = 10                                                                                                                                                     
                                                                                                                                                                                                         
             # Bỏ qua các đường contour quá nhỏ để không mất công giải mã (mặc định là 0.03)                                                                                                               
-            # parameters.minMarkerPerimeterRate = 0.03                                                                                                                                                      
+            parameters.minMarkerPerimeterRate = 0.04                                                                                                                                                      
                                                                                                                                                                                                         
             # Tắt tự động lọc góc mặc định của detector nếu bạn đã dùng cornerSubPix ở trên                                                                                                               
             parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_NONE  
@@ -898,8 +898,20 @@ class CameraWorker(QThread):
                         cx = int(np.mean(tracker.corners_filtered[:, 0]))
                         cy = int(np.mean(tracker.corners_filtered[:, 1]))
                         
-                        # Expand ROI box to accommodate movement (e.g., 350x350)
-                        roi_size = 350
+                        # Automatically calculate ROI size based on tag size in the previous frame
+                        corners_prev = tracker.corners_filtered
+                        tag_size_px = 100.0  # default fallback
+                        if corners_prev is not None and len(corners_prev) == 4:
+                            min_x_prev = np.min(corners_prev[:, 0])
+                            max_x_prev = np.max(corners_prev[:, 0])
+                            min_y_prev = np.min(corners_prev[:, 1])
+                            max_y_prev = np.max(corners_prev[:, 1])
+                            tag_w_prev = max_x_prev - min_x_prev
+                            tag_h_prev = max_y_prev - min_y_prev
+                            tag_size_px = max(tag_w_prev, tag_h_prev)
+                        
+                        # Expand ROI to 3.5 times the tag size, but at least 150px to ensure it doesn't get too small
+                        roi_size = max(150, int(tag_size_px * 3.5))
                         half_size = roi_size // 2
                         
                         x1 = max(0, cx - half_size)
@@ -921,13 +933,20 @@ class CameraWorker(QThread):
                                 detected_corners.append(c_global)
                                 detected_ids.append([cid])
                                 
-                    # If we found any tags in our ROI searches, use them
-                    if len(detected_ids) > 0:
+                    # Check if the source tag (source_id) is successfully detected in the ROI searches
+                    source_detected_in_roi = False
+                    for cid_list in detected_ids:
+                        if cid_list[0] == source_id:
+                            source_detected_in_roi = True
+                            break
+                    
+                    # If we found any tags in our ROI searches AND the source tag is successfully detected
+                    if len(detected_ids) > 0 and source_detected_in_roi:
                         corners = detected_corners
                         ids = np.array(detected_ids)
                         rejected = []
                     else:
-                        # Fallback: if we lost tags in ROI, scan the entire image
+                        # Fallback: if we lost tags in ROI or specifically lost source_id, scan the entire image
                         corners, ids, rejected = detector.detectMarkers(gray)
                 else:
                     # Full frame scan if no tags are currently tracked
@@ -1432,10 +1451,16 @@ class CameraWorker(QThread):
                 else:
                     self._trail_points.clear()
                 
-                # Compute distance to plane of targets if source and targets are detected
+                # Compute distance to the curved mesh surface of targets if source and targets are detected
                 if source_pos is not None and len(target_pts) > 0:
-                    # Perpendicular distance to the fitted plane of target tags
-                    poly_dist, poly_closest_3d = self._distance_point_to_fitted_plane(source_pos, target_pts)
+                    # Split target IDs into even and odd to represent the surface mesh
+                    even_ids = [tid for tid in target_ids if tid % 2 == 0]
+                    odd_ids = [tid for tid in target_ids if tid % 2 != 0]
+                    even_detected = [tid for tid in even_ids if tid in target_map]
+                    odd_detected = [tid for tid in odd_ids if tid in target_map]
+                    
+                    # Compute shortest distance to the curved mesh surface
+                    poly_dist, poly_closest_3d = self._distance_point_to_mesh_surface(source_pos, even_detected, odd_detected, target_map)
                     if poly_dist is not None:
                         raw_dist = poly_dist * 1000.0
                         
@@ -1451,13 +1476,9 @@ class CameraWorker(QThread):
                         filtered_dist = sum(self._distance_history) / len(self._distance_history)
                         results['polyline_dist'] = filtered_dist
                         
-                        # Split target IDs into even and odd to represent the surface mesh
-                        even_ids = [tid for tid in target_ids if tid % 2 == 0]
-                        odd_ids = [tid for tid in target_ids if tid % 2 != 0]
-                        
                         # Draw surface mesh connecting even and odd target tags
                         self._draw_surface_mesh(color_image, target_map, even_ids, odd_ids, cam_matrix, dist_coeffs)
-                        # Draw shortest path vector perpendicular to the fitted plane
+                        # Draw shortest path vector perpendicular to the curved surface mesh
                         self._draw_distance_vector(color_image, source_pos, poly_closest_3d, 
                                                    cam_matrix, dist_coeffs, (0, 255, 0), "Khoảng cách", filtered_dist)
                 else:
@@ -1575,6 +1596,118 @@ class CameraWorker(QThread):
         except Exception:
             # Fallback to segment in case SVD has issues
             return self._distance_point_to_segment(p, qs[0], qs[-1])
+
+    def _distance_point_to_triangle(self, p, a, b, c):
+        # 1. Project p onto the plane of the triangle
+        ab = b - a
+        ac = c - a
+        normal = np.cross(ab, ac)
+        normal_norm = np.linalg.norm(normal)
+        if normal_norm == 0.0:
+            # Degenerate triangle, treat as segments
+            d1, cl1 = self._distance_point_to_segment(p, a, b)
+            d2, cl2 = self._distance_point_to_segment(p, b, c)
+            d3, cl3 = self._distance_point_to_segment(p, c, a)
+            d_min = min(d1, d2, d3)
+            if d_min == d1: return d1, cl1
+            elif d_min == d2: return d2, cl2
+            else: return d3, cl3
+            
+        n = normal / normal_norm
+        ap = p - a
+        dist_plane = np.dot(ap, n)
+        p_proj = p - dist_plane * n
+        
+        # 2. Check if projected point is inside the triangle using barycentric coordinates
+        v0 = b - a
+        v1 = c - a
+        v2 = p_proj - a
+        
+        d00 = np.dot(v0, v0)
+        d01 = np.dot(v0, v1)
+        d11 = np.dot(v1, v1)
+        d20 = np.dot(v2, v0)
+        d21 = np.dot(v2, v1)
+        
+        denom = d00 * d11 - d01 * d01
+        if abs(denom) < 1e-8:
+            # Degenerate, fallback to edges
+            d1, cl1 = self._distance_point_to_segment(p, a, b)
+            d2, cl2 = self._distance_point_to_segment(p, b, c)
+            d3, cl3 = self._distance_point_to_segment(p, c, a)
+            d_min = min(d1, d2, d3)
+            if d_min == d1: return d1, cl1
+            elif d_min == d2: return d2, cl2
+            else: return d3, cl3
+            
+        v = (d11 * d20 - d01 * d21) / denom
+        w = (d00 * d21 - d01 * d20) / denom
+        u = 1.0 - v - w
+        
+        if u >= -1e-5 and v >= -1e-5 and w >= -1e-5:
+            # Inside the triangle
+            return abs(dist_plane), p_proj
+        else:
+            # Outside, find the closest point on the 3 edges
+            d1, cl1 = self._distance_point_to_segment(p, a, b)
+            d2, cl2 = self._distance_point_to_segment(p, b, c)
+            d3, cl3 = self._distance_point_to_segment(p, c, a)
+            d_min = min(d1, d2, d3)
+            if d_min == d1: return d1, cl1
+            elif d_min == d2: return d2, cl2
+            else: return d3, cl3
+
+    def _distance_point_to_mesh_surface(self, p, even_detected, odd_detected, target_map):
+        """
+        Calculates the minimum distance from point p to the surface mesh
+        formed by even and odd targets.
+        """
+        # If we have at least 2 even and 2 odd targets, we can form a mesh
+        if len(even_detected) > 1 and len(odd_detected) > 1:
+            min_dist = float('inf')
+            best_closest = None
+            
+            num_patches = min(len(even_detected), len(odd_detected)) - 1
+            for i in range(num_patches):
+                p1 = target_map[even_detected[i]]
+                p2 = target_map[even_detected[i+1]]
+                p3 = target_map[odd_detected[i+1]]
+                p4 = target_map[odd_detected[i]]
+                
+                # Triangle 1: (p1, p2, p3)
+                d1, cl1 = self._distance_point_to_triangle(p, p1, p2, p3)
+                if d1 < min_dist:
+                    min_dist = d1
+                    best_closest = cl1
+                    
+                # Triangle 2: (p1, p3, p4)
+                d2, cl2 = self._distance_point_to_triangle(p, p1, p3, p4)
+                if d2 < min_dist:
+                    min_dist = d2
+                    best_closest = cl2
+                    
+            return min_dist, best_closest
+            
+        # Fallback 1: If we only have even targets (or only odd targets), treat as polyline
+        elif len(even_detected) > 1:
+            pts = [target_map[tid] for tid in even_detected]
+            return self._distance_point_to_polyline(p, pts)
+        elif len(odd_detected) > 1:
+            pts = [target_map[tid] for tid in odd_detected]
+            return self._distance_point_to_polyline(p, pts)
+            
+        # Fallback 2: If we only have a total of 2 points, treat as segment
+        elif len(target_map) == 2:
+            keys = list(target_map.keys())
+            return self._distance_point_to_segment(p, target_map[keys[0]], target_map[keys[1]])
+            
+        # Fallback 3: If we only have 1 point, distance is direct Euclidean distance
+        elif len(target_map) == 1:
+            key = list(target_map.keys())[0]
+            pos = target_map[key]
+            return np.linalg.norm(p - pos), pos
+            
+        return None, None
 
     def _kabsch_alignment(self, P, Q):
         """
